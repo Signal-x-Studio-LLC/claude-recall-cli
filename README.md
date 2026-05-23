@@ -38,6 +38,45 @@ This installs `/recall` and `/recall-scan` as global Claude Code slash commands 
 | `/recall-scan 7` | Scan last N days |
 | `/recall-scan all` | Scan all sessions |
 
+## Poe — voice corpus
+
+`poe-extract.py` mines user turns across all sessions to build a queryable corpus of how you actually think, correct, and push back. Signals (corrections, preferences, rationale, rejections, declarations, approvals) are stored in the same `recall.db` under `voice_signals` + FTS5.
+
+| Command | Description |
+|---------|-------------|
+| `python3 poe-extract.py init` | Ensure the `voice_signals` schema exists in `recall.db` |
+| `python3 poe-extract.py extract` | Bulk scan all sessions into `~/.claude/poe/corpus.jsonl` |
+| `python3 poe-extract.py extract --session PATH` | Single-session scan → DB (hook mode) |
+| `python3 poe-extract.py publish` | Load `corpus.jsonl` into `recall.db` |
+| `python3 poe-extract.py assemble` | Build `~/.claude/poe/stack.md` from the DB |
+| `python3 poe-extract.py query <terms>` | FTS5 search the corpus, emit a markdown block to paste as context |
+| `python3 poe-extract.py run` | extract + publish + assemble (full refresh) |
+
+### Continuous generation (SessionEnd hook)
+
+Add to `~/.claude/settings.json` so every session automatically contributes new signals to Poe:
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/recall-cli/poe-extract.py extract --session \"$CLAUDE_SESSION_FILE\" >> ~/.claude/poe-extract.log 2>&1",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Deduplication is automatic — re-running on the same session is idempotent.
+
 ## Automatic scanning (session-end hook)
 
 By default, scanning is manual. To automatically scan for recall-worthy sessions every time a Claude Code session ends, add a `SessionEnd` hook to your global settings (`~/.claude/settings.json`):
