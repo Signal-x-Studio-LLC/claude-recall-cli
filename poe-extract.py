@@ -42,6 +42,14 @@ RECALL_DB = Path.home() / ".claude" / "recall.db"
 # Opportunistic-catchup staleness threshold for read paths (query/assemble).
 READ_PATH_STALE_SECONDS = 900  # 15 min
 
+# A surfaced "prior" must be SETTLED history, not a fresh message from an
+# in-flight concurrent session. The recall DB is machine-global and ingests
+# every session continuously, so without a floor a directive typed into one
+# live session leaks into another's prompt-hook as a "prior" within minutes.
+# Signals newer than this are excluded from the per-prompt surface.
+# (2026-05-29 cross-session-leak postmortem.)
+PRIOR_RECENCY_FLOOR_HOURS = 24
+
 NOISE_PREFIXES = (
     "[Request interrupted",
     "This session is being continued",
@@ -1446,7 +1454,7 @@ def _render_validated_section() -> list[str]:
         FROM validated_responses
         GROUP BY shape_signature
         ORDER BY c DESC
-        LIMIT 6
+        LIMIT 4
         """
     ).fetchall()
     # Pull one short exemplar per top shape for human readability.
@@ -1485,8 +1493,8 @@ def _render_validated_section() -> list[str]:
         lines.append("_Signature legend: `size/sentence-bucket/ends-with-Q-or-period + L=list + C=code`_")
         lines.append("")
         for sig, text, chars in exemplars:
-            preview = re.sub(r"\s+", " ", text[:240]).strip()
-            if len(text) > 240:
+            preview = re.sub(r"\s+", " ", text[:160]).strip()
+            if len(text) > 160:
                 preview += "…"
             lines.append(f"- **`{sig}`** ({chars} chars): \"{preview}\"")
         lines.append("")
@@ -1588,6 +1596,54 @@ def cmd_hook_stats(days: int = 7) -> None:
         print()
 
 
+def _relevant_signals(
+    conn: sqlite3.Connection,
+    tokens: list[str],
+    floor_iso: str,
+    current_session: str,
+    limit: int = 4,
+) -> list[tuple]:
+    """FTS-match prompt tokens against SETTLED voice signals, deduped by label.
+
+    Two guards keep one session's live context from leaking into another's as a
+    "prior" (the 2026-05-29 cross-session-leak class):
+      - recency floor: skip signals whose timestamp is newer than floor_iso, so
+        a fresh message from a concurrent in-flight session is never surfaced;
+      - self-echo: skip signals from current_session.
+    Timestamps are compared on their first 19 chars (YYYY-MM-DDTHH:MM:SS) so the
+    UTC 'Z' suffix doesn't break lexical ordering. Dedupe by label so a
+    high-volume label (e.g. 'instead') can't dominate the top-K.
+    """
+    if not tokens:
+        return []
+    fts_query = " OR ".join(tokens[:5])
+    rows = conn.execute(
+        """
+        SELECT v.signal_type, v.label, v.phrase, v.project
+        FROM voice_signals_fts f
+        JOIN voice_signals v ON v.id = f.rowid
+        WHERE voice_signals_fts MATCH ?
+          AND v.signal_type IN ('correction', 'preference', 'rejection')
+          AND (v.timestamp = '' OR substr(v.timestamp, 1, 19) < ?)
+          AND v.session_id != ?
+        ORDER BY rank
+        LIMIT 50
+        """,
+        (fts_query, floor_iso, current_session),
+    ).fetchall()
+    out: list[tuple] = []
+    seen_labels: set[str] = set()
+    for row in rows:
+        label = row[1]
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        out.append(row)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def cmd_prompt_hook() -> None:
     """UserPromptSubmit hook entry point. Reads Claude Code hook JSON from
     stdin, surfaces a compact Poe context block on stdout that gets injected
@@ -1623,33 +1679,19 @@ def cmd_prompt_hook() -> None:
 
     relevant_signals: list[tuple] = []
     if RECALL_DB.exists() and tokens:
+        # Settled-history-only: exclude signals newer than the recency floor (so a
+        # live instruction from a concurrent in-flight session can't surface as a
+        # "prior") and exclude this session's own signals (self-echo).
+        floor_iso = (
+            datetime.now(timezone.utc) - timedelta(hours=PRIOR_RECENCY_FLOOR_HOURS)
+        ).strftime("%Y-%m-%dT%H:%M:%S")
+        current_session = payload.get("session_id") or ""
         try:
             conn = sqlite3.connect(str(RECALL_DB))
-            fts_query = " OR ".join(tokens[:5])
-            # Dedupe by label: max 1 representative per label. Without this,
-            # common labels like 'instead' dominate the top-K by phrase volume.
-            rows = conn.execute(
-                """
-                SELECT v.signal_type, v.label, v.phrase, v.project
-                FROM voice_signals_fts f
-                JOIN voice_signals v ON v.id = f.rowid
-                WHERE voice_signals_fts MATCH ?
-                  AND v.signal_type IN ('correction', 'preference', 'rejection')
-                ORDER BY rank
-                LIMIT 50
-                """,
-                (fts_query,),
-            ).fetchall()
+            relevant_signals = _relevant_signals(
+                conn, tokens, floor_iso, current_session
+            )
             conn.close()
-            seen_labels: set[str] = set()
-            for row in rows:
-                label = row[1]
-                if label in seen_labels:
-                    continue
-                seen_labels.add(label)
-                relevant_signals.append(row)
-                if len(relevant_signals) >= 4:
-                    break
         except sqlite3.OperationalError:
             relevant_signals = []
 
@@ -2090,11 +2132,13 @@ def cmd_assemble(_skip_catchup: bool = False) -> None:
             label_scores.items(), key=lambda kv: kv[1][0], reverse=True
         ):
             label_recs = by_signal_label[(stype, label)]
-            reps = dedupe_by_phrase(label_recs, limit=6)
+            reps = dedupe_by_phrase(label_recs, limit=3)
             lines.append(f"### `{label}` ({count} occurrences, weight {score:.1f})")
             lines.append("")
             for r in reps:
                 phrase = re.sub(r"\s+", " ", r["phrase"]).strip()
+                if len(phrase) > 200:
+                    phrase = phrase[:200].rsplit(" ", 1)[0] + "…"
                 proj = r.get("project", "?")
                 lines.append(f"- \"{phrase}\" — _{proj}_")
             lines.append("")
@@ -2128,7 +2172,7 @@ def cmd_assemble(_skip_catchup: bool = False) -> None:
             if not prior:
                 continue
             # Use the last sentence of prior_assistant — usually the actual question.
-            tail = prior[-280:]
+            tail = prior[-180:]
             key = re.sub(r"\W+", " ", tail.lower())[:160]
             if key in seen_q:
                 continue
@@ -2139,7 +2183,7 @@ def cmd_assemble(_skip_catchup: bool = False) -> None:
             lines.append(f"  Nino replied: **\"{phrase}\"** — _{proj}_")
             lines.append("")
             shown += 1
-            if shown >= 20:
+            if shown >= 6:
                 break
         lines.append("")
 
@@ -2153,11 +2197,13 @@ def cmd_assemble(_skip_catchup: bool = False) -> None:
         label_counts = Counter(r["label"] for r in other_approvals)
         for label, count in label_counts.most_common():
             label_recs = [r for r in other_approvals if r["label"] == label]
-            reps = dedupe_by_phrase(label_recs, limit=6)
+            reps = dedupe_by_phrase(label_recs, limit=3)
             lines.append(f"### `{label}` ({count} occurrences)")
             lines.append("")
             for r in reps:
                 phrase = re.sub(r"\s+", " ", r["phrase"]).strip()
+                if len(phrase) > 200:
+                    phrase = phrase[:200].rsplit(" ", 1)[0] + "…"
                 proj = r.get("project", "?")
                 lines.append(f"- \"{phrase}\" — _{proj}_")
             lines.append("")
