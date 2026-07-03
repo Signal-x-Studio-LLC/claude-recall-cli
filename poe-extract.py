@@ -60,6 +60,13 @@ NOISE_PREFIXES = (
     "<bash-input>",
     "<bash-stdout>",
     "<bash-stderr>",
+    # Agent-generated prompts (multi-agent sessions). These arrive through the
+    # UserPromptSubmit path but are not Nino's voice — ingesting them drifts
+    # the tone fingerprint toward machine-written text.
+    "<task-notification>",
+    "<teammate-message",
+    "<agent-message",
+    "Another Claude session sent a message",
 )
 
 # Messages dominated by pasted logs/code/tool output are not user voice.
@@ -1658,6 +1665,11 @@ def cmd_prompt_hook() -> None:
         return
     prompt = payload.get("prompt") or payload.get("user_message") or ""
     if not prompt or len(prompt) < 20:
+        return
+    # Agent-generated prompts (task notifications, teammate messages) are not
+    # Nino's voice — don't classify, retrieve, or log them. Same catalog the
+    # bulk extractor uses, so both ingestion paths stay in sync.
+    if prompt.lstrip().startswith(NOISE_PREFIXES):
         return
 
     # Prompt-intent classification predicts elicitation shapes; situation

@@ -2,6 +2,22 @@
 
 Paused 2026-03-24. Resume ~2026-06-24 with 3 months of accumulated session data.
 
+## Resume run executed 2026-07-02
+
+`extract --days 90` + `correlate` on n=838 sessions (pass rate 0.498, followup-fix rate 0.142). Followup-fix predictors, sorted:
+
+| Metric | r (Jul, n=838) | r (Mar, n=349) |
+|--------|----------------|----------------|
+| prompt_count | +0.227 | +0.18 |
+| anti_pattern_count | +0.213 | +0.15 |
+| edit_count | +0.202 | +0.18 |
+| focused_thrash | +0.198 | +0.14 |
+| tool_misuses | +0.192 | +0.12 |
+| thrash_ratio | +0.135 | +0.03 |
+| compliance_score | -0.096 | -0.08 |
+
+Every live signal strengthened with 2.4x the data, but none cleared the r > 0.25 gate for building `/recall calibrate` — max r² ≈ 0.05. Verdict per the gate: do not build calibrate; the "accept the ceiling" branch (item 6) applies unless external signals (git diffs, CI results) get wired in. The quality-measurement half costs nothing passively (extraction is manual), so it stays as-is rather than being archived. Separate observation from the same audit: the recipe library has had no saves since 2026-03-19 — the save/reuse habit never formed; the live value is Poe + followup-fix detection.
+
 ---
 
 ## What we built (2026-03-24)
