@@ -75,8 +75,11 @@ def mine(projects_dir: Path) -> dict:
     edits_count = Counter()
     bash_sigs = Counter()
     bash_examples = {}
+    bash_sig_projects = defaultdict(set)
     bash_file_creates = []
     per_project_writes = Counter()
+    write_basename_projects = defaultdict(set)
+    write_basename_counts = Counter()
     tool_counts = Counter()
     n_lines = 0
     n_files = 0
@@ -116,6 +119,10 @@ def mine(projects_dir: Path) -> dict:
                             if p:
                                 writes.append((p, classify(p), pname, ts, side))
                                 per_project_writes[pname] += 1
+                                base = os.path.basename(p)
+                                if base.endswith(SCRIPT_EXTS):
+                                    write_basename_projects[base].add(pname)
+                                    write_basename_counts[base] += 1
                         elif name == "Edit":
                             p = inp.get("file_path") or ""
                             if p:
@@ -127,6 +134,7 @@ def mine(projects_dir: Path) -> dict:
                             sig = normalize_bash(cmd)
                             bash_sigs[sig] += 1
                             bash_examples.setdefault(sig, cmd[:200])
+                            bash_sig_projects[sig].add(pname)
                             for m in HEREDOC_RE.finditer(cmd):
                                 bash_file_creates.append((m.group(1), pname, ts))
                             for m in TEE_RE.finditer(cmd):
@@ -178,9 +186,16 @@ def mine(projects_dir: Path) -> dict:
             for k, v in eph_scripts.most_common(80)
         ],
         "bash_top_signatures": [
-            {"sig": s, "count": c, "example": bash_examples[s]}
+            {"sig": s, "count": c, "projects": len(bash_sig_projects[s]),
+             "project_names": sorted(x.replace("-Users-nino-Workspace-dev-", "") for x in bash_sig_projects[s])[:8],
+             "example": bash_examples[s]}
             for s, c in bash_sigs.most_common(120)
         ],
+        "cross_project_script_writes": [
+            {"name": k, "count": write_basename_counts[k], "projects": sorted(x.replace("-Users-nino-Workspace-dev-", "") for x in v)[:10]}
+            for k, v in sorted(write_basename_projects.items(), key=lambda kv: -len(kv[1]))
+            if len(v) >= 2
+        ][:60],
         "bash_file_creates_sample": bash_file_creates[:100],
         "gone_workspace_sample": gone_workspace[:200],
         "gone_workspace_total": len(gone_workspace),
