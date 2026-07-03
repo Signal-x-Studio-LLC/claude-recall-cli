@@ -38,6 +38,27 @@ This installs `/recall` and `/recall-scan` as global Claude Code slash commands 
 | `/recall-scan 7` | Scan last N days |
 | `/recall-scan all` | Scan all sessions |
 
+## Artifact miner — what did Claude create, and did it survive?
+
+`artifact-miner.py` is the artifact-side complement to Poe: it streams every
+session transcript (including nested subagent transcripts) and extracts
+creation events — files written, Bash heredoc/tee file creates, repeated Bash
+procedure signatures — then checks which written paths still exist on disk,
+merged to a repo from a removed worktree, or are gone (tmp/scratchpad
+ephemera). Use it to find throwaway scripts worth promoting to durable tools
+and conversational procedures worth codifying.
+
+| Command | Description |
+|---------|-------------|
+| `python3 artifact-miner.py` | Mine all sessions → `artifact-mine.json` in cwd |
+| `python3 artifact-miner.py --out results.json` | Choose the output path |
+| `python3 artifact-miner.py --projects-dir PATH` | Non-default sessions dir |
+
+Before this existed, one-off variants were rebuilt in throwaway sessions 12+
+times (`mine_sessions.py`, `mine_failures_v3.py`, `friction_mining_v2.py`, …)
+— all written to `/tmp` and lost. If you're about to write a new session
+miner, extend this one instead.
+
 ## Poe — voice corpus
 
 `poe-extract.py` mines user turns across all sessions to build a queryable corpus of how you actually think, correct, and push back. Signals (corrections, preferences, rationale, rejections, declarations, approvals) are stored in the same `recall.db` under `voice_signals` + FTS5.
