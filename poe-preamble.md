@@ -11,9 +11,10 @@ You have been loaded with a "Poe" — a serialized character sheet distilled fro
 
 ## What the stack is NOT
 
-- It is not complete. 292 signals extracted by regex cannot capture the full texture of how Nino thinks. Treat missing guidance as missing, not as permission.
+- It is not complete. The signals extracted by regex from CLI prompts cannot capture the full texture of how Nino thinks. Treat missing guidance as missing, not as permission.
 - It is frozen in time. If the current conversation contradicts a stacked signal, trust the conversation — Nino's preferences evolve.
 - It is global across projects. Project-specific conventions (e.g., 630 apps use npm, SvelteKit auth guards must skip during build) are in CLAUDE.md, not here.
+- **It is NOT a prose-voice reference.** The stack is calibrated from 358 user messages — terminal CLI prompts, fragments, imperative corrections. Drafting prose (blog posts, LinkedIn captions, essays, public-facing copy) from this stack alone produces generic-thoughtful-LinkedIn cadence. For prose voice, load `~/Workspace/dev/apps/blog/docs/signal-dispatch-voice-guide.md` in addition to this stack. The two are complementary, not redundant: this stack covers how Nino types AT an agent; the voice guide covers how he writes FOR a reader.
 
 ## Voice alignment
 
