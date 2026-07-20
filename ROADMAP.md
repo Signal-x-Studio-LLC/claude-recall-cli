@@ -92,6 +92,20 @@ In order of utility:
 
 ---
 
+## Backlog — situation gating for injected priors (added 2026-07-20)
+
+The prompt-hook's `relevant_signals` are keyword-matched with no situational
+fit check. Evidence from the 2026-07-20 A/B config probe: a "we always push
+for north star features" prior was injected into a restraint-shaped question
+(should a shared contract be thrown out?) and tilted the response toward a
+fleet-wide rewrite; bare-model runs without the injection pushed back 2/2.
+Interim mitigation shipped: a caution line appended after the signals block
+in `cmd_prompt_hook`. Real fix: classify the prompt's decision shape
+(expand vs restrain vs compare) and filter priors whose label rewards the
+opposite direction — reuse `classify_situation`'s machinery; the label
+taxonomy (`preference/we-convention`, `rejection/instead`, ...) already
+carries most of the needed signal.
+
 ## What to do when resuming (~June 2026)
 
 ### Immediate (day 1)

@@ -1748,6 +1748,16 @@ def cmd_prompt_hook() -> None:
             phrase_clean = re.sub(r"\s+", " ", phrase).strip()[:180]
             proj = (project or "?").split("/")[-1]
             out.append(f"- [{stype}/{label}] \"{phrase_clean}\" _{proj}_")
+        # Keyword-matched priors carry no situational fit. The 2026-07-20
+        # A/B probe showed a "push for north star features" prior landing on
+        # a restraint-shaped question and tilting the response toward a
+        # fleet-wide rewrite the evidence didn't support.
+        out.append(
+            "Caution: these are keyword-matched, not situation-matched. "
+            "Discard any prior that rewards scale, rebuilds, or new scope when "
+            "the actual question is whether to hold back, compare candidates, "
+            "or use an existing smaller mechanism."
+        )
     out.append("</poe-context>")
     print("\n".join(out))
 
