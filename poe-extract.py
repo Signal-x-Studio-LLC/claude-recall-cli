@@ -1647,12 +1647,66 @@ def cmd_hook_stats(days: int = 7) -> None:
         print()
 
 
+# Retrieval bar. The hook's contract is "silence is the default — noise on every
+# prompt is worse than no hook at all", but measured emission was 99.2% over
+# 1244 invocations (30d to 2026-07-24). Two causes, both fixed below:
+#   1. The FTS index covers `message` — the whole user turn, up to 4000 chars —
+#      so one token landing anywhere inside a long paste surfaced the signal.
+#      Matching is now scoped to `phrase`, the extracted sentence itself.
+#   2. The query was OR across tokens, so a single common word was enough.
+#      A candidate must now share MIN_TOKEN_OVERLAP distinct prompt tokens with
+#      the phrase (or one long, specific token), and clear a bm25 floor.
+# Overlap is checked on word-prefixes because the FTS tokenizer is porter-stemmed
+# ("retrieval" must still count against "retrieve").
+# Threshold picked by replaying 3639 real prompts from hook.log, not guessed.
+# Emission: overlap>=3 -> 34.4%, >=4 -> 6.7%, >=5 -> 1.3%. Four is the knee.
+# At 3 the survivors are word coincidence ("migrating our backend to TypeScript"
+# pulled up "bc migraiton is out"); at 4 they're on topic ("urvil wants me to add
+# stripe" pulled up "defer stripe config for now").
+#
+# Deliberately NOT thresholding on bm25. bm25 scores depend on corpus-wide IDF,
+# so any absolute floor tuned against this 650-signal corpus would mute a fresh
+# or small one entirely — it broke the in-memory test DB immediately. Token
+# overlap is corpus-size independent and does the semantic work anyway.
+#
+# Consequence worth knowing: a prompt with fewer than MIN_TOKEN_OVERLAP content
+# words can never surface a prior. That is intended — short prompts carry too
+# little topic to match on.
+MIN_TOKEN_OVERLAP = 4
+OVERLAP_PREFIX = 6          # word-prefix length; FTS is porter-stemmed
+NEAR_DUP_RATIO = 0.75       # candidate is ~the prompt restated: no information
+
+
+def _phrase_overlap(phrase: str, tokens: list[str]) -> int:
+    """Count distinct prompt tokens appearing as word-prefixes in the phrase."""
+    words = [w for w in re.split(r"\W+", phrase.lower()) if w]
+    return sum(
+        1 for t in tokens
+        if any(w.startswith(t[:OVERLAP_PREFIX]) for w in words)
+    )
+
+
+def _is_near_duplicate(phrase: str, prompt: str) -> bool:
+    """True when the candidate is essentially the prompt said again.
+
+    A prior that restates what Nino just typed carries no information — it
+    reads as insight but is an echo. Word-set containment rather than string
+    similarity, so reordering and light edits still count as the same thing.
+    """
+    a = {w for w in re.split(r"\W+", phrase.lower()) if len(w) >= 4}
+    b = {w for w in re.split(r"\W+", prompt.lower()) if len(w) >= 4}
+    if not a or not b:
+        return False
+    return len(a & b) / min(len(a), len(b)) >= NEAR_DUP_RATIO
+
+
 def _relevant_signals(
     conn: sqlite3.Connection,
     tokens: list[str],
     floor_iso: str,
     current_session: str,
     limit: int = 4,
+    prompt: str = "",
 ) -> list[tuple]:
     """FTS-match prompt tokens against SETTLED voice signals, deduped by label.
 
@@ -1664,24 +1718,43 @@ def _relevant_signals(
     Timestamps are compared on their first 19 chars (YYYY-MM-DDTHH:MM:SS) so the
     UTC 'Z' suffix doesn't break lexical ordering. Dedupe by label so a
     high-volume label (e.g. 'instead') can't dominate the top-K.
+
+    Relevance bar: see MIN_TOKEN_OVERLAP above. A candidate that merely matched
+    the FTS query is not enough — it has to actually be about the same thing.
     """
     if not tokens:
         return []
-    fts_query = " OR ".join(tokens[:5])
-    rows = conn.execute(
-        """
-        SELECT v.signal_type, v.label, v.phrase, v.project
-        FROM voice_signals_fts f
-        JOIN voice_signals v ON v.id = f.rowid
-        WHERE voice_signals_fts MATCH ?
-          AND v.signal_type IN ('correction', 'preference', 'rejection')
-          AND (v.timestamp = '' OR substr(v.timestamp, 1, 19) < ?)
-          AND v.session_id != ?
-        ORDER BY rank
-        LIMIT 50
-        """,
-        (fts_query, floor_iso, current_session),
-    ).fetchall()
+    # Scope the match to `phrase`; `message` carries pasted content and is noise.
+    fts_query = "phrase : (" + " OR ".join(tokens[:5]) + ")"
+    try:
+        rows = conn.execute(
+            """
+            SELECT v.signal_type, v.label, v.phrase, v.project,
+                   bm25(voice_signals_fts) AS score
+            FROM voice_signals_fts f
+            JOIN voice_signals v ON v.id = f.rowid
+            WHERE voice_signals_fts MATCH ?
+              AND v.signal_type IN ('correction', 'preference', 'rejection')
+              AND (v.timestamp = '' OR substr(v.timestamp, 1, 19) < ?)
+              AND v.session_id != ?
+            ORDER BY score
+            LIMIT 50
+            """,
+            (fts_query, floor_iso, current_session),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    scored = []
+    for stype, label, phrase, project, _score in rows:
+        if "[Image #" in phrase:
+            continue
+        if _phrase_overlap(phrase, tokens) < MIN_TOKEN_OVERLAP:
+            continue
+        if prompt and _is_near_duplicate(phrase, prompt):
+            continue
+        scored.append((stype, label, phrase, project))
+    rows = scored
     out: list[tuple] = []
     seen_labels: set[str] = set()
     for row in rows:
@@ -1745,7 +1818,7 @@ def cmd_prompt_hook() -> None:
         try:
             conn = sqlite3.connect(str(RECALL_DB))
             relevant_signals = _relevant_signals(
-                conn, tokens, floor_iso, current_session
+                conn, tokens, floor_iso, current_session, prompt=prompt
             )
             conn.close()
         except sqlite3.OperationalError:

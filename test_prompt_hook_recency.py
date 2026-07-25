@@ -24,7 +24,8 @@ spec.loader.exec_module(poe)
 
 NOW = datetime.now(timezone.utc)
 FLOOR = (NOW - timedelta(hours=poe.PRIOR_RECENCY_FLOOR_HOURS)).strftime("%Y-%m-%dT%H:%M:%S")
-TOKENS = ["merge", "session", "pivot"]
+# Four tokens: MIN_TOKEN_OVERLAP is 4, so a 3-token fixture could never match.
+TOKENS = ["merge", "session", "pivot", "worktree"]
 
 
 def _iso(dt: datetime) -> str:
@@ -67,7 +68,9 @@ def test_settled_signal_surfaces():
         conn,
         session_id="old-session",
         ts=_iso(NOW - timedelta(days=10)),
-        phrase="we should merge with a branch or worktree instead of a separate session",
+        # Must share MIN_TOKEN_OVERLAP tokens with TOKENS to clear the relevance
+        # bar — this test guards the recency window, not the threshold.
+        phrase="we should merge that session into a worktree instead of a pivot",
     )
     out = poe._relevant_signals(conn, TOKENS, FLOOR, current_session="me")
     assert len(out) == 1, f"settled prior should surface, got {out}"
@@ -103,6 +106,54 @@ def test_empty_tokens_returns_nothing():
     conn = _mkconn()
     _insert(conn, session_id="old", ts=_iso(NOW - timedelta(days=10)), phrase="merge session pivot")
     assert poe._relevant_signals(conn, [], FLOOR, current_session="me") == []
+
+
+# --- relevance bar (2026-07-24) -------------------------------------------
+# The hook's contract is "silence is the default", but measured emission was
+# 99.2% over 1244 invocations. Cause: FTS matched against `message` (the whole
+# user turn, incl. pasted content) with OR across tokens, so one common word
+# surfaced a prior. These guard the tightened bar.
+
+def test_weak_topical_match_excluded():
+    """A prior sharing only one token with the prompt is not a prior."""
+    conn = _mkconn()
+    _insert(
+        conn,
+        session_id="old-session",
+        ts=_iso(NOW - timedelta(days=10)),
+        phrase="rotate the hero images on the gallery site every session",
+    )
+    out = poe._relevant_signals(conn, TOKENS, FLOOR, current_session="me")
+    assert out == [], f"single-token match must not surface, got {out}"
+
+
+def test_near_duplicate_of_prompt_excluded():
+    """Restating what Nino just typed reads as insight but carries no information."""
+    conn = _mkconn()
+    phrase = "merge the session pivot work before the next branch cut"
+    _insert(
+        conn,
+        session_id="old-session",
+        ts=_iso(NOW - timedelta(days=10)),
+        phrase=phrase,
+    )
+    out = poe._relevant_signals(
+        conn, TOKENS, FLOOR, current_session="me", prompt=phrase
+    )
+    assert out == [], f"near-duplicate of the prompt must not surface, got {out}"
+
+
+def test_pasted_image_reference_excluded():
+    """[Image #N] rows are transcript artifacts, never voice."""
+    conn = _mkconn()
+    _insert(
+        conn,
+        session_id="old-session",
+        ts=_iso(NOW - timedelta(days=10)),
+        phrase="[Image #3] merge the session pivot into this layout",
+    )
+    out = poe._relevant_signals(conn, TOKENS, FLOOR, current_session="me")
+    assert out == [], f"image-reference row must not surface, got {out}"
 
 
 if __name__ == "__main__":
