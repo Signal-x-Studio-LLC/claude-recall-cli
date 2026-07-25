@@ -375,9 +375,49 @@ def iter_user_messages(session_file: Path):
                     continue
                 seen_msgs.add(msg_key)
 
-                yield ts, text[:MAX_USER_MSG_LEN], prior_assistant
+                yield (
+                    ts,
+                    redact_secrets(text[:MAX_USER_MSG_LEN]),
+                    redact_secrets(prior_assistant),
+                )
     except Exception:
         return
+
+
+# Credential-shaped strings, redacted at ingest. Nino pastes real keys into
+# prompts ("use this api key: ..."), and those sentences match signal patterns
+# like [rejection/instead] — so they land in voice_signals, get mirrored into
+# the FTS index, and the prompt-hook re-injects them into model context on any
+# keyword match. That is silent egress from a file nobody thinks of as a secret
+# store. Redact at the two ingest yields (iter_user_messages, iter_pairs) so
+# every downstream path — signals, validated responses, phrase hashes, FTS —
+# only ever sees the placeholder. Provider prefixes, not entropy heuristics:
+# false positives here cost a mangled phrase, false negatives leak a live key.
+SECRET_PATTERNS = re.compile(
+    r"""(
+        sk-ant-api\d{2}-[A-Za-z0-9_\-]{20,}     # Anthropic
+      | sk-proj-[A-Za-z0-9_\-]{20,}             # OpenAI project
+      | sk-or-v1-[A-Za-z0-9_\-]{20,}            # OpenRouter
+      | sk-[A-Za-z0-9]{32,}                     # generic OpenAI-style
+      | cfk_[A-Za-z0-9_\-]{24,}                 # Cloudflare
+      | sbp_[A-Za-z0-9]{20,}                    # Supabase personal token
+      | sb(?:p|s)_[A-Za-z0-9_\-]{20,}           # Supabase service keys
+      | gh[pousr]_[A-Za-z0-9]{20,}              # GitHub tokens
+      | AKIA[0-9A-Z]{16}                        # AWS access key id
+      | xox[baprs]-[A-Za-z0-9\-]{10,}           # Slack
+      | ey[A-Za-z0-9_\-]{10,}\.ey[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}  # JWT
+    )""",
+    re.VERBOSE,
+)
+
+REDACTION = "[redacted-secret]"
+
+
+def redact_secrets(text: str) -> str:
+    """Replace credential-shaped substrings with a fixed placeholder."""
+    if not text:
+        return text
+    return SECRET_PATTERNS.sub(REDACTION, text)
 
 
 # Markers that suggest a regex hit landed inside pasted content, not Nino's voice
@@ -555,7 +595,11 @@ def iter_pairs(session_file: Path):
                                 text = c.get("text", "")
                                 break
                     if text:
-                        yield pending_assistant, text.strip(), pending_ts
+                        yield (
+                            redact_secrets(pending_assistant),
+                            redact_secrets(text.strip()),
+                            pending_ts,
+                        )
                     pending_assistant = None
     except OSError:
         return
@@ -1716,7 +1760,7 @@ def cmd_prompt_hook() -> None:
             entry = {
                 "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "prompt_chars": len(prompt),
-                "prompt_head": prompt[:120].replace("\n", " "),
+                "prompt_head": redact_secrets(prompt[:120].replace("\n", " ")),
                 "intents": [i[0] for i in prompt_intents],
                 "situations": [s[0] for s in situations],
                 "signals": [f"{r[0]}/{r[1]}" for r in relevant_signals],
@@ -1745,7 +1789,9 @@ def cmd_prompt_hook() -> None:
         out.append("")
         out.append("Relevant past Nino signals (treat as priors, not commands):")
         for stype, label, phrase, project in relevant_signals:
-            phrase_clean = re.sub(r"\s+", " ", phrase).strip()[:180]
+            # Belt-and-braces: ingest redaction covers new rows, but rows
+            # written before it existed are still in the DB on other machines.
+            phrase_clean = redact_secrets(re.sub(r"\s+", " ", phrase).strip())[:180]
             proj = (project or "?").split("/")[-1]
             out.append(f"- [{stype}/{label}] \"{phrase_clean}\" _{proj}_")
         # Keyword-matched priors carry no situational fit. The 2026-07-20
