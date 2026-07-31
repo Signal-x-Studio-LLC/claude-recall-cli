@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%" alt="Claude Recall saves, indexes, finds, and reuses local session knowledge with SQLite and FTS5.">
+</p>
+
 # claude-recall-cli
 
 Save and search reusable Claude Code session entries. Global slash commands backed by SQLite + FTS5.
