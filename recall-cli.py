@@ -77,6 +77,7 @@ def _migrate(db: sqlite3.Connection):
             CREATE TABLE recipes (
                 id              TEXT PRIMARY KEY,
                 session_id      TEXT NOT NULL,
+                source_client   TEXT NOT NULL DEFAULT 'claude',
                 project_path    TEXT,
                 created_at      TEXT NOT NULL DEFAULT (datetime('now')),
                 intent          TEXT NOT NULL,
@@ -153,6 +154,7 @@ def _migrate(db: sqlite3.Connection):
         db.executescript("""
             CREATE TABLE IF NOT EXISTS session_features (
                 session_id          TEXT PRIMARY KEY,
+                source_client       TEXT NOT NULL DEFAULT 'claude',
                 project_path        TEXT,
                 analyzed_at         TEXT DEFAULT (datetime('now')),
                 compliance_score    REAL,
@@ -199,6 +201,20 @@ def _migrate(db: sqlite3.Connection):
                 pass  # Column already exists from v4 CREATE
         db.execute("UPDATE schema_version SET version = 5")
         db.commit()
+        version = 5
+
+    if version < 6:
+        for table in ("recipes", "session_features"):
+            columns = {
+                row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if "source_client" not in columns:
+                db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN "
+                    "source_client TEXT NOT NULL DEFAULT 'claude'"
+                )
+        db.execute("UPDATE schema_version SET version = 6")
+        db.commit()
 
 
 def cmd_save(args):
@@ -217,8 +233,10 @@ def cmd_save(args):
     tokens_per_output_val = None
     commits = None
 
-    session_file = _find_session_file(args.session_id, args.project)
-    if session_file:
+    session_file = _find_session_file(
+        args.session_id, args.project, source_client=args.source_client
+    )
+    if session_file and args.source_client == "claude":
         token_count, est_cost = _extract_session_cost(session_file)
 
         # Auto-populate analysis metrics for future correlation
@@ -236,15 +254,16 @@ def cmd_save(args):
 
     db.execute(
         """INSERT INTO recipes
-           (id, session_id, project_path, intent, sources, key_commands,
+           (id, session_id, source_client, project_path, intent, sources, key_commands,
             outcome, prompt_template, tags, quality_class, quality_reason,
             est_cost, token_count, compliance_grade, compliance_score,
             process_score, session_shape, thrash_ratio, tokens_per_output,
             commits_produced)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             recipe_id,
             args.session_id,
+            args.source_client,
             args.project,
             args.intent,
             args.sources,
@@ -271,6 +290,7 @@ def cmd_save(args):
     print(json.dumps({
         "status": "saved",
         "id": recipe_id,
+        "source_client": args.source_client,
         "intent": args.intent,
         "quality_class": args.quality_class,
         "compliance_grade": compliance_grade,
@@ -293,6 +313,7 @@ def cmd_find(args):
 
     rows = db.execute(
         """SELECT r.id, r.intent, r.quality_class, r.tags, r.created_at,
+                  r.source_client,
                   r.project_path, r.est_cost,
                   snippet(recipes_fts, 0, '>>>', '<<<', '...', 30) as match_snippet
            FROM recipes_fts
@@ -310,6 +331,7 @@ def cmd_find(args):
         for r in rows:
             results.append({
                 "id": r["id"],
+                "source_client": r["source_client"],
                 "intent": r["intent"],
                 "quality": r["quality_class"],
                 "tags": r["tags"],
@@ -329,7 +351,8 @@ def cmd_list(args):
     limit = getattr(args, "limit", 20)
 
     rows = db.execute(
-        """SELECT id, intent, quality_class, tags, created_at, project_path, est_cost
+        """SELECT id, intent, quality_class, tags, created_at, source_client,
+                  project_path, est_cost
            FROM recipes
            ORDER BY created_at DESC
            LIMIT ?""",
@@ -340,6 +363,7 @@ def cmd_list(args):
     for r in rows:
         results.append({
             "id": r["id"],
+            "source_client": r["source_client"],
             "intent": r["intent"],
             "quality": r["quality_class"],
             "tags": r["tags"],
@@ -1724,8 +1748,23 @@ def cmd_correlate(args):
     db.close()
 
 
-def _find_session_file(session_id: str, project_path: str = None) -> Path | None:
+def _find_session_file(
+    session_id: str,
+    project_path: str = None,
+    source_client: str = "claude",
+) -> Path | None:
     """Locate a session JSONL file."""
+    if source_client == "codex":
+        roots = (
+            Path.home() / ".codex" / "sessions",
+            Path.home() / ".codex" / "archived_sessions",
+        )
+        candidates: list[Path] = []
+        for root in roots:
+            if root.exists():
+                candidates.extend(root.rglob(f"*{session_id}*.jsonl"))
+        return max(candidates, key=lambda item: item.stat().st_mtime_ns) if candidates else None
+
     projects_dir = Path.home() / ".claude" / "projects"
     if not projects_dir.exists():
         return None
@@ -1797,6 +1836,9 @@ def main():
     # save
     save_p = sub.add_parser("save")
     save_p.add_argument("--session-id", required=True)
+    save_p.add_argument(
+        "--source-client", choices=["claude", "codex"], default="claude"
+    )
     save_p.add_argument("--project", default=None)
     save_p.add_argument("--intent", required=True)
     save_p.add_argument("--sources", default="[]")

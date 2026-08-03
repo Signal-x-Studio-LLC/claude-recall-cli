@@ -65,7 +65,7 @@ miner, extend this one instead.
 
 ## Poe — voice corpus
 
-`poe-extract.py` mines user turns across all sessions to build a queryable corpus of how you actually think, correct, and push back. Signals (corrections, preferences, rationale, rejections, declarations, approvals) are stored in the same `recall.db` under `voice_signals` + FTS5.
+`poe-extract.py` mines human turns from Claude Code and Codex sessions to build a queryable corpus of how you actually think, correct, and push back. Signals (corrections, preferences, rationale, rejections, declarations, approvals) are stored in the same `recall.db` under `voice_signals` + FTS5 with `source_client` provenance.
 
 | Command | Description |
 |---------|-------------|
@@ -76,10 +76,13 @@ miner, extend this one instead.
 | `python3 poe-extract.py assemble` | Build `~/.claude/poe/stack.md` from the DB |
 | `python3 poe-extract.py query <terms>` | FTS5 search the corpus, emit a markdown block to paste as context |
 | `python3 poe-extract.py run` | extract + publish + assemble (full refresh) |
+| `python3 poe-extract.py catchup --include-codex` | Idempotently ingest Claude plus active/archived Codex transcripts |
 
 ### Continuous generation (SessionEnd hook)
 
-Add to `~/.claude/settings.json` so every session automatically contributes new signals to Poe:
+Claude Code and Codex can share the same fast queue and launchd worker. The hook only records transcript identity; database work happens out of band.
+
+Claude Code uses:
 
 ```json
 {
@@ -90,8 +93,8 @@ Add to `~/.claude/settings.json` so every session automatically contributes new 
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.claude/recall-cli/poe-extract.py extract --session \"$CLAUDE_SESSION_FILE\" >> ~/.claude/poe-extract.log 2>&1",
-            "timeout": 30
+            "command": "python3 ~/Workspace/dev/tools/claude-recall-cli/poe-extract.py enqueue",
+            "timeout": 5
           }
         ]
       }
@@ -100,7 +103,21 @@ Add to `~/.claude/settings.json` so every session automatically contributes new 
 }
 ```
 
-Deduplication is automatic — re-running on the same session is idempotent.
+Codex uses the same command under `SessionEnd` with a three-second timeout. Its queue record includes `session_id`, so the worker can find a transcript after Codex moves it into `archived_sessions`. Add `--include-codex` to the launchd worker's `drain-queue` arguments for hourly catch-up of missed events.
+
+Deduplication is automatic. Delete a raw transcript only after its current path and modification time are covered by `ingest_watermark`, and after any durable lesson has been promoted into a recipe or canonical project documentation.
+
+### Codex closeout and retention
+
+The global `$session-closeout` skill handles the judgment step that automatic mining cannot. Invoke it explicitly, or use closeout language such as `close out this task`, `wrap this session up`, `prepare this task for archive`, or `make this archive-ready`. The prompt hook routes those phrases to the skill; the skill verifies evidence, promotes a reusable recipe only when warranted, and emits an `Archive-safe: yes|no` receipt. It never archives or deletes a task.
+
+Review and trust newly added hooks through Codex's `/hooks` interface. A practical retention policy is:
+
+1. Close out substantive tasks before archiving them.
+2. Keep canonical project truth in the owning repository and reusable procedures in `recall.db`; do not create recap files for chronology alone.
+3. Let `SessionEnd` enqueue the transcript and let the launchd worker advance its watermark.
+4. Keep a short grace window for archived raw transcripts, then delete only files whose exact path and current modification time remain covered by `ingest_watermark`.
+5. Keep active task transcripts. Prune disposable build artifacts in Codex worktrees independently; they are not session memory.
 
 ## Automatic scanning (session-end hook)
 
