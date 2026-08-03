@@ -15,6 +15,9 @@ The public tutorial and interactive demo can explain the architecture and its tr
 - A D1 Time Travel restore is rehearsed without overwriting the live database.
 - An R2 snapshot is regenerated from D1 and compared with the Approved row count.
 - Credential-shaped test payloads are rejected, and no raw transcript fields appear in D1 or R2.
+- Both machines record separate before-and-after byte counts for raw transcripts, `recall.db`, the durable outbox, and linked-worktree build output. A total workspace size is not accepted as a memory-growth measurement.
+- A retention dry run lists only archived transcripts whose exact path and modification time are covered by the ingest watermark. Active transcripts and unpromoted evidence remain ineligible for deletion.
+- D1 and R2 storage are recorded after the field run so the release notes can state measured cloud growth instead of projecting from local transcript volume.
 
 Record exact commands, timestamps, Worker deployment version, machine labels, event IDs, and memory IDs. Screenshots and session summaries can illustrate the run, but they do not replace the receipts.
 
@@ -26,4 +29,3 @@ Record exact commands, timestamps, Worker deployment version, machine labels, ev
 4. Tag the first release whose claims match the receipts.
 
 Until then, keep the existing repository name and label the Cloudflare layer `0.1 prototype`.
-

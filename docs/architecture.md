@@ -61,3 +61,12 @@ The local database is the offline buffer. A failed upload stays `pending`. An ac
 
 The daily maintenance job marks expired Candidate or Approved records Stale, deletes old ingest receipts after the configured retention period, and writes a fresh approved-memory snapshot to R2. D1 Time Travel remains the recovery mechanism for the primary store.
 
+## Storage is three separate problems
+
+Do not use one disk-usage number to make a retention decision. Measure these independently:
+
+- **Source evidence:** active and archived harness transcripts. A transcript becomes eligible for local cleanup only after its exact path and modification time are covered by the ingest watermark and its durable lessons have been promoted.
+- **Distilled memory:** `recall.db`, the local outbox, D1 rows, and replaceable R2 snapshots. These should grow much more slowly than the source corpus and keep their own retention receipts.
+- **Disposable work output:** linked-worktree build directories such as `target/`, `node_modules/`, and `.next/`. Prune these with the worktree reaper; they are neither source evidence nor memory.
+
+The context plane must not solve local disk pressure by copying raw transcripts into cloud storage. Local cleanup stays watermark-gated, and build-output cleanup stays an independent operation.
