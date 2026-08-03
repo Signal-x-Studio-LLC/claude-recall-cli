@@ -40,7 +40,11 @@ cd claude-recall-cli
 git switch codex/context-plane
 
 op item list --vault "Developer Secrets" | rg 'Cloudflare recall-context-plane'
-PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q
+
+field_test_venv="$(mktemp -d "${TMPDIR:-/tmp}/recall-field-tests.XXXXXX")"
+python3 -m venv "$field_test_venv"
+"$field_test_venv/bin/python" -m pip install --quiet pytest==8.4.2
+PYTHONDONTWRITEBYTECODE=1 "$field_test_venv/bin/python" -m pytest -q
 
 python3 poe-extract.py drain-queue --include-codex --include-gemini
 python3 context-plane.py baseline
@@ -65,6 +69,16 @@ pending automatic-signal payload with a metadata-only local hash receipt; the
 source signal remains in `recall.db`.
 
 Read `/health` from the deployed Worker and record `version.id`; the response is the cross-machine deployment receipt and does not require Wrangler on the client machine.
+
+The temporary virtual environment makes the local command independent of the
+machine's ambient Python packages. `python3 -m unittest discover` is not an
+equivalent fallback because it does not collect the pytest-style test functions.
+
+Client validation does not require Wrangler access to the Cloudflare account.
+Do not switch a machine's logged-in Wrangler account or provision another admin
+credential merely to inspect deployments. The public `/health` version is the
+deployment receipt; authenticated ingest and MCP use the scoped context-plane
+bearer token from 1Password.
 
 Each harness needs five real sessions whose durable lesson is worth promoting
 to a recipe. Re-running a watermark sweep cannot create evidence, and synthetic
