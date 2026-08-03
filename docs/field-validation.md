@@ -29,3 +29,48 @@ Record exact commands, timestamps, Worker deployment version, machine labels, ev
 4. Tag the first release whose claims match the receipts.
 
 Until then, keep the existing repository name and label the Cloudflare layer `0.1 prototype`.
+
+## Run one machine
+
+Use a stable public label such as `machine-a` or `machine-b`; do not put the hostname in a public receipt.
+
+```bash
+git clone git@github.com:nino-chavez/claude-recall-cli.git
+cd claude-recall-cli
+git switch codex/context-plane
+
+op item list --vault "Developer Secrets" | rg 'Cloudflare recall-context-plane'
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q
+
+python3 poe-extract.py drain-queue --include-codex --include-gemini
+python3 context-plane.py baseline
+python3 poe-extract.py retention-report --grace-days 7
+
+with-secret 'Cloudflare recall-context-plane' \
+  --as RECALL_CONTEXT_TOKEN -- \
+  adapters/sync-context-plane.sh
+```
+
+Baseline only on a machine that has never synced this local database. On a previously initialized machine, omit `baseline`; running it again would hide unsent local records by moving the cursor.
+
+Install the three client adapters from `adapters/`, then perform the retrieval checks in [Connect Claude, Codex, and Gemini](connect-clients.md). A configuration listing is not a connection receipt. Record the client's connected status and the returned memory ID without copying retrieved text into the receipt.
+
+Record local storage separately:
+
+```bash
+for path in \
+  "$HOME/.claude/projects" \
+  "$HOME/.codex/sessions" \
+  "$HOME/.codex/archived_sessions" \
+  "$HOME/.gemini/tmp" \
+  "$HOME/.claude/recall.db"
+do
+  if [[ -e "$path" ]]; then du -sk "$path"; else echo "missing $path"; fi
+done
+```
+
+Do not delete anything during field validation. The retention report always returns `deletion_authorized: false`; session closeout remains a separate human judgment.
+
+## Current field runs
+
+- [Machine A — 2026-08-03](field-runs/2026-08-03-machine-a.md): local baseline and retention receipt; multi-machine gate remains open.

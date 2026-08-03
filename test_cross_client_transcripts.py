@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -222,3 +225,83 @@ def test_codex_queue_entry_resolves_after_archive_move(tmp_path):
         poe.CODEX_ARCHIVED_SESSIONS_DIR = old_archived
 
     assert resolved == moved
+
+
+def _retention_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        """
+        CREATE TABLE ingest_watermark (
+            session_path TEXT PRIMARY KEY,
+            source_client TEXT NOT NULL,
+            last_mtime_ns INTEGER NOT NULL,
+            last_ingested TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    return conn
+
+
+def test_retention_report_only_covers_unchanged_archived_files_after_grace(tmp_path):
+    archive = tmp_path / "archived_sessions"
+    archive.mkdir()
+    now = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
+
+    covered = archive / "covered.jsonl"
+    changed = archive / "changed.jsonl"
+    recent = archive / "recent.jsonl"
+    uncovered = archive / "uncovered.jsonl"
+    for path in (covered, changed, recent, uncovered):
+        path.write_text("{}\n")
+
+    old_ns = int((now - timedelta(days=10)).timestamp() * 1_000_000_000)
+    recent_ns = int((now - timedelta(days=1)).timestamp() * 1_000_000_000)
+    os.utime(covered, ns=(old_ns, old_ns))
+    os.utime(changed, ns=(old_ns, old_ns))
+    os.utime(uncovered, ns=(old_ns, old_ns))
+    os.utime(recent, ns=(recent_ns, recent_ns))
+
+    conn = _retention_conn()
+    conn.execute(
+        "INSERT INTO ingest_watermark VALUES (?, 'codex', ?, datetime('now'))",
+        (str(covered), covered.stat().st_mtime_ns),
+    )
+    conn.execute(
+        "INSERT INTO ingest_watermark VALUES (?, 'codex', ?, datetime('now'))",
+        (str(changed), changed.stat().st_mtime_ns - 1),
+    )
+    conn.execute(
+        "INSERT INTO ingest_watermark VALUES (?, 'codex', ?, datetime('now'))",
+        (str(recent), recent.stat().st_mtime_ns),
+    )
+
+    report = poe.build_retention_report(
+        conn, archive, grace_days=7, now=now, list_covered=True
+    )
+
+    assert report["scanned_files"] == 4
+    assert report["watermark_covered"]["files"] == 1
+    assert report["changed_after_ingest"]["files"] == 1
+    assert report["too_recent"]["files"] == 1
+    assert report["uncovered"]["files"] == 1
+    assert report["errors"]["files"] == 0
+    assert report["deletion_authorized"] is False
+    assert [item["path"] for item in report["covered_files"]] == [str(covered)]
+
+
+def test_retention_report_fails_closed_for_missing_archive_or_bad_grace(tmp_path):
+    conn = _retention_conn()
+
+    try:
+        poe.build_retention_report(conn, tmp_path / "missing")
+        assert False, "missing archive directory should fail"
+    except FileNotFoundError:
+        pass
+
+    archive = tmp_path / "archived_sessions"
+    archive.mkdir()
+    try:
+        poe.build_retention_report(conn, archive, grace_days=-1)
+        assert False, "negative grace should fail"
+    except ValueError:
+        pass

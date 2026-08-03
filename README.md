@@ -90,6 +90,7 @@ miner, extend this one instead.
 | `python3 poe-extract.py query <terms>` | FTS5 search the corpus, emit a markdown block to paste as context |
 | `python3 poe-extract.py run` | extract + publish + assemble (full refresh) |
 | `python3 poe-extract.py catchup --include-codex --include-gemini` | Idempotently ingest Claude, active/archived Codex, and retained Gemini transcripts |
+| `python3 poe-extract.py retention-report` | Dry-run watermark coverage for archived Codex transcripts; never deletes or declares archive safety |
 
 ### Continuous generation (SessionEnd hook)
 
@@ -157,6 +158,8 @@ Review and trust newly added hooks through Codex's `/hooks` interface. A practic
 3. Let `SessionEnd` enqueue the transcript and let the launchd worker advance its watermark.
 4. Keep a short grace window for archived raw transcripts, then delete only files whose exact path and current modification time remain covered by `ingest_watermark`.
 5. Keep active task transcripts. Prune disposable build artifacts in Codex worktrees independently; they are not session memory.
+
+Run `python3 poe-extract.py retention-report --grace-days 7` before any transcript cleanup. The report separates covered, recent, uncovered, and changed files. It always returns `deletion_authorized: false`; a watermark proves that bytes were ingested, not that the session's durable lessons were promoted.
 
 ## Automatic scanning (session-end hook)
 

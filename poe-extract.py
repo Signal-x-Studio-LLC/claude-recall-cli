@@ -952,6 +952,103 @@ def cmd_catchup(
             print(f"stack rebuild failed: {e}", file=sys.stderr)
 
 
+def build_retention_report(
+    conn: sqlite3.Connection,
+    archive_dir: Path,
+    grace_days: int = 7,
+    now: datetime | None = None,
+    list_covered: bool = False,
+) -> dict:
+    """Measure watermark-covered archived Codex transcripts without deleting them.
+
+    Watermark coverage proves ingestion, not semantic closeout or promotion, so
+    this report never declares a file safe to delete.
+    """
+    if grace_days < 0:
+        raise ValueError("grace_days must be zero or greater")
+    if not archive_dir.is_dir():
+        raise FileNotFoundError(f"archive directory not found: {archive_dir}")
+
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    grace_seconds = grace_days * 86400
+    totals = {
+        "watermark_covered": {"files": 0, "bytes": 0},
+        "too_recent": {"files": 0, "bytes": 0},
+        "uncovered": {"files": 0, "bytes": 0},
+        "changed_after_ingest": {"files": 0, "bytes": 0},
+        "errors": {"files": 0, "bytes": 0},
+    }
+    covered: list[dict] = []
+
+    for transcript in sorted(archive_dir.glob("*.jsonl")):
+        try:
+            stat = transcript.stat()
+        except OSError:
+            totals["errors"]["files"] += 1
+            continue
+
+        row = conn.execute(
+            "SELECT last_mtime_ns FROM ingest_watermark WHERE session_path = ?",
+            (str(transcript),),
+        ).fetchone()
+        watermark_ns = int(row[0]) if row else 0
+        age_seconds = max(0.0, reference.timestamp() - stat.st_mtime)
+
+        if not watermark_ns:
+            bucket = "uncovered"
+        elif watermark_ns < stat.st_mtime_ns:
+            bucket = "changed_after_ingest"
+        elif age_seconds < grace_seconds:
+            bucket = "too_recent"
+        else:
+            bucket = "watermark_covered"
+
+        totals[bucket]["files"] += 1
+        totals[bucket]["bytes"] += stat.st_size
+        if bucket == "watermark_covered" and list_covered:
+            covered.append(
+                {
+                    "path": str(transcript),
+                    "bytes": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "watermark_ns": watermark_ns,
+                    "age_days": round(age_seconds / 86400, 2),
+                }
+            )
+
+    report = {
+        "source_client": "codex",
+        "archive_dir": str(archive_dir),
+        "grace_days": grace_days,
+        "scanned_files": sum(bucket["files"] for bucket in totals.values()),
+        **totals,
+        "deletion_authorized": False,
+        "note": (
+            "Watermark coverage proves ingestion only. Delete nothing until "
+            "human closeout confirms durable lessons and project truth were promoted."
+        ),
+    }
+    if list_covered:
+        report["covered_files"] = covered
+    return report
+
+
+def cmd_retention_report(grace_days: int = 7, list_covered: bool = False) -> None:
+    conn = db_connect()
+    try:
+        report = build_retention_report(
+            conn,
+            CODEX_ARCHIVED_SESSIONS_DIR,
+            grace_days=grace_days,
+            list_covered=list_covered,
+        )
+    finally:
+        conn.close()
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
 def _resolve_queued_transcript(entry: dict) -> Path | None:
     """Resolve a queued transcript after Codex may have archived/moved it."""
     raw_path = entry.get("transcript_path") or entry.get("session_file") or ""
@@ -2592,6 +2689,19 @@ def main() -> None:
         help="include Gemini transcripts in the fallback catchup sweep",
     )
 
+    rr = sub.add_parser(
+        "retention-report",
+        help="dry-run watermark coverage for archived Codex transcripts; never deletes",
+    )
+    rr.add_argument(
+        "--grace-days", type=int, default=7,
+        help="minimum archive age before reporting a covered file (default: 7)",
+    )
+    rr.add_argument(
+        "--list-covered", action="store_true",
+        help="include paths and watermark evidence for covered archived files",
+    )
+
     sub.add_parser("enqueue", help="hook command: read stdin JSON, append transcript_path to queue")
     sub.add_parser("prompt-hook", help="UserPromptSubmit hook: emit Poe context for the prompt")
 
@@ -2638,6 +2748,11 @@ def main() -> None:
             verbose=args.verbose,
             include_codex=args.include_codex,
             include_gemini=args.include_gemini,
+        )
+    elif args.cmd == "retention-report":
+        cmd_retention_report(
+            grace_days=args.grace_days,
+            list_covered=args.list_covered,
         )
     elif args.cmd == "enqueue":
         cmd_enqueue()
