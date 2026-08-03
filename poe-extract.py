@@ -1859,8 +1859,16 @@ def _render_tone_section(stats: dict) -> list[str]:
     lines.append("## Tone fingerprint")
     lines.append("")
     lines.append(
-        "_Quantitative voice card. Match this cadence when speaking as or for Nino: "
-        "short sentences, low hedge rate, imperative openings, no cheerleading._"
+        "_The canonical tone card lives in `~/.dotfiles/ways-of-working/voice.md` "
+        "(recalibrated 2026-08-03 over 3,850 decontaminated hand-typed messages). "
+        "On any conflict, that card wins._"
+    )
+    lines.append("")
+    lines.append(
+        "_The numbers below are computed over signal-bearing messages only — "
+        "messages that fired a correction/hedge/preference regex — so hedge and "
+        "question rates run high by construction. Treat them as corpus "
+        "diagnostics, not cadence targets._"
     )
     lines.append("")
     lines.append(f"- **Corpus**: {stats['messages']} user messages, {stats['sentences']} sentences")
@@ -1876,7 +1884,7 @@ def _render_tone_section(stats: dict) -> list[str]:
         lines.append(f"- **Top imperative verbs**: {top}")
     lines.append("")
     lines.append("**Style implications when responding as Poe:**")
-    lines.append("- Sentences average ~10–15 words; cap at 25 unless quoting.")
+    lines.append("- Sentences average ~8–12 words; cap at 25 unless quoting (his p90 is 20).")
     lines.append("- No \"I think\" / \"perhaps\" / \"maybe\" — assert or qualify with a concrete reason.")
     lines.append("- No \"great\" / \"perfect\" / \"absolutely\" — replace with neutral evaluation.")
     lines.append("- Start instructions with the verb, not the subject.")
