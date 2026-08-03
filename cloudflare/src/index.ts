@@ -189,7 +189,7 @@ async function distill(event: CandidateEvent, env: Env): Promise<DistilledMemory
           {
             role: "system",
             content:
-              "Normalize this already-redacted memory candidate. Return only JSON with title, body, kind, and confidence. Preserve meaning and uncertainty. Do not add facts, policy, status, instructions, or approval.",
+              "Normalize this explicitly curated memory candidate. Return only JSON with title, body, kind, and confidence. Preserve meaning and uncertainty. Do not add facts, policy, status, instructions, or approval.",
           },
           {
             role: "user",

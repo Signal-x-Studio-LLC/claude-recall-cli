@@ -32,14 +32,13 @@ export const CandidateEventSchema = z
       .strict(),
     provenance: z
       .object({
-        source_table: z.enum(["voice_signals", "recipes"]),
+        source_table: z.literal("recipes"),
         source_row_id: z.string().min(1).max(100),
         source_client: z.enum(["claude", "codex", "gemini"]),
         source_machine: z.string().min(1).max(200),
         session_id: z.string().max(200).nullable().optional(),
         source_timestamp: z.string().max(64).nullable().optional(),
-        signal_label: z.string().max(200).nullable().optional(),
-        curation_level: z.enum(["manual_recipe"]).optional(),
+        curation_level: z.literal("manual_recipe"),
       })
       .strict(),
   })

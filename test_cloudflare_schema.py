@@ -5,6 +5,7 @@ from pathlib import Path
 MIGRATIONS = Path(__file__).parent / "cloudflare" / "migrations"
 SCHEMA = MIGRATIONS / "0001_init.sql"
 PRIVACY_MIGRATION = MIGRATIONS / "0002_remove_raw_provenance.sql"
+LOCAL_ONLY_MIGRATION = MIGRATIONS / "0003_keep_voice_signals_local.sql"
 
 
 def test_cloudflare_schema_enforces_state_and_fts_contracts():
@@ -84,5 +85,28 @@ def test_cloudflare_schema_enforces_state_and_fts_contracts():
     conn.executescript(PRIVACY_MIGRATION.read_text())
     assert conn.execute(
         "SELECT COUNT(*) FROM memory_events WHERE event_type = 'provenance_redacted'"
+    ).fetchone() == (1,)
+
+    conn.executescript(LOCAL_ONLY_MIGRATION.read_text())
+    title, body, project, status, confidence = conn.execute(
+        "SELECT title, body, project, status, confidence FROM memories WHERE id = ?",
+        (values[0],),
+    ).fetchone()
+    assert title == "Local-only voice signal removed"
+    assert "stays local" in body
+    assert "canonical adapter" not in body
+    assert project is None
+    assert status == "Stale"
+    assert confidence == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM memory_events WHERE event_type = 'content_redacted'"
+    ).fetchone() == (1,)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'canonical'"
+    ).fetchone() == (0,)
+
+    conn.executescript(LOCAL_ONLY_MIGRATION.read_text())
+    assert conn.execute(
+        "SELECT COUNT(*) FROM memory_events WHERE event_type = 'content_redacted'"
     ).fetchone() == (1,)
     conn.close()

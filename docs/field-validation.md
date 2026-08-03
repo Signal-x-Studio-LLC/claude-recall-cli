@@ -7,14 +7,14 @@ The public tutorial and interactive demo can explain the architecture and its tr
 ## Evidence required before a rename
 
 - Two physical machines ingest through separate durable outboxes.
-- Claude Code, Codex, and Gemini CLI each contribute at least five processed candidates.
+- Claude Code, Codex, and Gemini CLI each contribute at least five manually promoted recipes that become processed candidates.
 - At least one offline interval proves retry and later acknowledgment without duplicate memories.
 - At least ten candidates receive human review across Approved, Contradicted, Superseded, and Stale outcomes.
 - Each harness retrieves the same Approved memory and omits the same non-Approved memory by default.
 - A superseded memory points to its replacement and preserves both event histories.
-- A D1 Time Travel restore is rehearsed without overwriting the live database.
+- A D1 Time Travel restore is rehearsed on a separate remote rehearsal database without overwriting the live database.
 - An R2 snapshot is regenerated from D1 and compared with the Approved row count.
-- Credential-shaped test payloads are rejected. D1 and R2 may contain the bounded, credential-redacted candidate body, but never a raw transcript, whole raw message, assistant response, or transcript-derived provenance excerpt.
+- Credential-shaped payloads and automatically mined voice signals are rejected. D1 and R2 may contain deliberately promoted recipe fields, but never a raw transcript, mined phrase, whole raw message, assistant response, or transcript-derived provenance excerpt.
 - Both machines record separate before-and-after byte counts for raw transcripts, `recall.db`, the durable outbox, and linked-worktree build output. A total workspace size is not accepted as a memory-growth measurement.
 - A retention dry run lists only archived transcripts whose exact path and modification time are covered by the ingest watermark. Active transcripts and unpromoted evidence remain ineligible for deletion.
 - D1 and R2 storage are recorded after the field run so the release notes can state measured cloud growth instead of projecting from local transcript volume.
@@ -46,6 +46,7 @@ python3 poe-extract.py drain-queue --include-codex --include-gemini
 python3 context-plane.py baseline
 python3 poe-extract.py retention-report --grace-days 7
 python3 context-plane.py sanitize-outbox
+python3 context-plane.py quarantine-local-only  # existing prototype outboxes only
 python3 context-plane.py status
 
 with-secret 'Cloudflare recall-context-plane' \
@@ -55,11 +56,19 @@ with-secret 'Cloudflare recall-context-plane' \
 
 Baseline only on a machine that has never synced this local database. On a previously initialized machine, omit `baseline`; running it again would hide unsent local records by moving the cursor.
 
-Before any push, `status` must report both `unsafe_payloads: 0` and `invalid_outbox_payloads: 0`. The Worker independently rejects `provenance.evidence_excerpt` and other extra provenance fields. Existing prototype outboxes must run `sanitize-outbox` once before retrying.
+Before any push, `status` must report both `unsafe_payloads: 0` and
+`invalid_outbox_payloads: 0`. The Worker independently rejects automatic voice
+signals, `provenance.evidence_excerpt`, and other extra provenance fields.
+Existing prototype outboxes must run `sanitize-outbox`, then
+`quarantine-local-only`, before retrying. The quarantine command replaces each
+pending automatic-signal payload with a metadata-only local hash receipt; the
+source signal remains in `recall.db`.
 
 Read `/health` from the deployed Worker and record `version.id`; the response is the cross-machine deployment receipt and does not require Wrangler on the client machine.
 
-If retained Gemini sessions contain fewer than five candidate-worthy human signals, complete real work in Gemini until five exist. Re-running the same watermark sweep cannot create evidence, and synthetic human preferences do not satisfy this gate.
+Each harness needs five real sessions whose durable lesson is worth promoting
+to a recipe. Re-running a watermark sweep cannot create evidence, and synthetic
+preferences do not satisfy this gate.
 
 Install the three client adapters from `adapters/`, then perform the retrieval checks in [Connect Claude, Codex, and Gemini](connect-clients.md). A configuration listing is not a connection receipt. Record the client's connected status and the returned memory ID without copying retrieved text into the receipt.
 

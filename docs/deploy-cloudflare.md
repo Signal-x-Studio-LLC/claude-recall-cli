@@ -87,11 +87,13 @@ python3 ../context-plane.py status
 
 An event moves `pending` → `sent` → `acknowledged`. A `sent` item is waiting for a Queue receipt; it is not yet proof that D1 contains the memory.
 
-The outbox status must show `unsafe_payloads: 0` before push. The Worker rejects transcript-derived provenance excerpts even if an older client tries to send one.
+The outbox status must show `unsafe_payloads: 0` before push. The Worker rejects
+automatic voice signals and transcript-derived provenance excerpts even if an
+older client tries to send them.
 
 ## 5. Enable AI Gateway only after the deterministic path passes
 
-Create an AI Gateway named `recall-context` and a dynamic route named `recall-distill`. Configure that route to use an approved model and provider credentials. The Worker sends only already-redacted candidate text and sets `collectLog: false`.
+Create an AI Gateway named `recall-context` and a dynamic route named `recall-distill`. Configure that route to use an approved model and provider credentials. The Worker sends only explicitly curated recipe text and sets `collectLog: false`.
 
 Change this setting in `wrangler.jsonc` and redeploy:
 
@@ -110,6 +112,39 @@ Normalization can change `title`, `body`, `kind`, and `confidence`. It cannot ch
 - Queue delivery is at least once. Stable IDs and unique constraints make replay safe.
 - Raw transcripts remain local and follow the local watermark plus archive-grace policy.
 - Migration `0002_remove_raw_provenance.sql` removes the prototype's old `evidence_excerpt` field and writes a non-content audit event. On an existing deployment, record a recovery bookmark and obtain approval before applying that destructive redaction remotely.
+- Migration `0003_keep_voice_signals_local.sql` replaces older cloud voice-signal content with a local-only marker and writes a non-content audit event. Record a recovery bookmark and obtain approval before applying it remotely.
+- Rehearse Time Travel against a separate remote D1 database built from the same schema. Cloudflare restores a database in place and does not currently clone a production bookmark into another database, so the rehearsal proves the restore mechanism without touching live data.
+
+### Time Travel rehearsal
+
+Use a uniquely named remote database. Do not bind it to the Worker and do not
+substitute the live database name in any command:
+
+```bash
+rehearsal_db="recall-context-recovery-$(date -u +%Y%m%d%H%M%S)"
+npx wrangler d1 create "$rehearsal_db"
+npx wrangler d1 execute "$rehearsal_db" --remote --file migrations/0001_init.sql --yes
+npx wrangler d1 execute "$rehearsal_db" --remote --yes --command \
+  "INSERT INTO memories (id, stable_key, kind, title, body, status, confidence, source_client, source_machine, provenance_json) VALUES ('mem_recovery_test', 'recovery:test', 'recipe', 'Recovery fixture', 'before restore', 'Candidate', 1, 'codex', 'rehearsal', '{\"source_table\":\"recipes\",\"source_row_id\":\"fixture\",\"source_client\":\"codex\",\"source_machine\":\"rehearsal\",\"curation_level\":\"manual_recipe\"}');"
+bookmark="$(npx wrangler d1 time-travel info "$rehearsal_db" --json | jq -r '.bookmark')"
+test -n "$bookmark" && test "$bookmark" != "null"
+printf 'pre-mutation bookmark: %s\n' "$bookmark"
+```
+
+Record the printed bookmark, mutate only the rehearsal row, then restore the
+same rehearsal database to that bookmark:
+
+```bash
+npx wrangler d1 execute "$rehearsal_db" --remote --yes --command \
+  "UPDATE memories SET body = 'after bookmark' WHERE id = 'mem_recovery_test';"
+npx wrangler d1 time-travel restore "$rehearsal_db" --bookmark="$bookmark"
+npx wrangler d1 execute "$rehearsal_db" --remote --json --command \
+  "SELECT COUNT(*) AS restored FROM memories WHERE id = 'mem_recovery_test' AND body = 'before restore'; SELECT COUNT(*) AS post_bookmark_value FROM memories WHERE id = 'mem_recovery_test' AND body = 'after bookmark';"
+```
+
+A valid receipt reports `restored: 1` and `post_bookmark_value: 0`, plus the
+bookmark Wrangler returns for undoing the restore. Keep or delete the rehearsal
+database only under the operator's normal Cloudflare resource policy.
 
 Trigger a snapshot after the first Approved record:
 

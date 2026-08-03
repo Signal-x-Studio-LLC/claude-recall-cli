@@ -8,21 +8,22 @@ const candidate = {
   event_type: "memory_candidate",
   occurred_at: "2026-08-02T20:00:00Z",
   memory: {
-    stable_key: "voice_signals:1",
-    kind: "correction",
-    title: "Use the canonical adapter",
-    body: "Use the canonical adapter instead of another wrapper.",
+    stable_key: "recipes:r1",
+    kind: "recipe",
+    title: "Recover an interrupted upload",
+    body: "Resume from the recorded checkpoint and verify the final object.",
     project: "tools/recall",
     status: "Candidate",
     confidence: 0.55,
   },
   provenance: {
-    source_table: "voice_signals",
-    source_row_id: "1",
+    source_table: "recipes",
+    source_row_id: "r1",
     source_client: "codex",
     source_machine: "test-mac",
     session_id: "s1",
     source_timestamp: "2026-08-02T20:00:00Z",
+    curation_level: "manual_recipe",
   },
 };
 
@@ -102,6 +103,26 @@ describe("ingest boundary", () => {
             provenance: {
               ...candidate.provenance,
               evidence_excerpt: "verbatim prompt text must stay local",
+            },
+          },
+        ],
+      }),
+      env,
+    );
+    expect(response.status).toBe(400);
+    expect(queued).toHaveLength(0);
+  });
+
+  it("rejects automatically mined voice signals", async () => {
+    const { env, queued } = fakeEnv();
+    const response = await handleIngest(
+      request("correct-token", {
+        events: [
+          {
+            ...candidate,
+            provenance: {
+              ...candidate.provenance,
+              source_table: "voice_signals",
             },
           },
         ],

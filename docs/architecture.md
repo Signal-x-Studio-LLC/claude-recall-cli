@@ -10,9 +10,10 @@ flowchart LR
     C["Claude Code"] --> H["Fast SessionEnd queue"]
     O["Codex"] --> H
     G["Gemini CLI"] --> H
-    H --> L["Local mining and redaction"]
+    H --> L["Local mining"]
     L --> S["SQLite recall.db"]
-    S --> B["Durable local outbox"]
+    S --> P["Deliberate recipe promotion"]
+    P --> B["Durable local outbox"]
   end
 
   B -->|"Bearer-authenticated batches"| I["Cloudflare Worker"]
@@ -29,15 +30,26 @@ flowchart LR
 
 ## What crosses the network
 
-Only staged `voice_signals` and manually saved `recipes` cross the network. The candidate body is the bounded phrase or recipe selected by the local miner, with credential redaction applied again before writing the outbox. Raw messages, assistant responses, transcript fields, and evidence excerpts stay on the machine where they were created.
+Only manually saved `recipes` cross the network. Automatically mined
+`voice_signals` are transcript-derived evidence and remain local, even after
+credential masking. A recipe crosses only after the closeout or `/recall save`
+path has deliberately promoted its intent, outcome, and optional reusable
+prompt. Credential redaction runs again before the outbox write. Raw messages,
+assistant responses, transcript fields, mined phrases, and evidence excerpts
+stay on the machine where they were created.
 
-Cloud provenance contains identifiers only: source client, machine, session ID, source timestamp, local table, and local row ID. The Worker rejects transcript-derived provenance fields. Stable event IDs make retries safe. A local item is not complete when the Worker accepts it; it becomes `acknowledged` only after the Queue consumer records a processed receipt.
+Cloud provenance contains identifiers only: source client, machine, session ID,
+source timestamp, local table, local row ID, and the `manual_recipe` curation
+marker. The Worker rejects automatic signals and transcript-derived provenance
+fields. Stable event IDs make retries safe. A local item is not complete when
+the Worker accepts it; it becomes `acknowledged` only after the Queue consumer
+records a processed receipt.
 
 ## Memory states
 
 | State | Meaning | May guide normal work? |
 |---|---|---|
-| `Candidate` | Machine-mined evidence waiting for review | No |
+| `Candidate` | Locally curated recipe waiting for cloud review | No |
 | `Approved` | A human accepted the memory for reuse | Yes, unless Git contradicts it |
 | `Contradicted` | Later evidence conflicts with it | No |
 | `Superseded` | A newer memory replaced it | No |

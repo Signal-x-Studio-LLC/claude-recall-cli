@@ -13,21 +13,22 @@ const event = CandidateEventSchema.parse({
   event_type: "memory_candidate",
   occurred_at: "2026-08-02T20:00:00Z",
   memory: {
-    stable_key: "voice_signals:1",
-    kind: "correction",
-    title: "Use the canonical adapter",
-    body: "Use the canonical adapter instead of another wrapper.",
+    stable_key: "recipes:r1",
+    kind: "recipe",
+    title: "Recover an interrupted upload",
+    body: "Resume from the recorded checkpoint and verify the final object.",
     project: "tools/recall",
     status: "Candidate",
     confidence: 0.55,
   },
   provenance: {
-    source_table: "voice_signals",
-    source_row_id: "1",
+    source_table: "recipes",
+    source_row_id: "r1",
     source_client: "gemini",
     source_machine: "test-mac",
     session_id: "s1",
     source_timestamp: "2026-08-02T20:00:00Z",
+    curation_level: "manual_recipe",
   },
 });
 
@@ -45,6 +46,18 @@ describe("context plane domain", () => {
         provenance: {
           ...event.provenance,
           evidence_excerpt: "verbatim prompt text must stay local",
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects automatically mined voice signals", () => {
+    expect(() =>
+      CandidateEventSchema.parse({
+        ...event,
+        provenance: {
+          ...event.provenance,
+          source_table: "voice_signals",
         },
       }),
     ).toThrow();

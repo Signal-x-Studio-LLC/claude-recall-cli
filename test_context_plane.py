@@ -51,7 +51,7 @@ class ContextPlaneTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_stage_is_idempotent_and_omits_approvals(self):
+    def test_stage_is_idempotent_and_keeps_automatic_signals_local(self):
         with patch.dict(os.environ, {"RECALL_MACHINE_ID": "test-mac"}):
             self.assertEqual(context_plane.cmd_stage(backfill=True), 0)
             self.assertEqual(context_plane.cmd_stage(backfill=True), 0)
@@ -60,16 +60,16 @@ class ContextPlaneTests(unittest.TestCase):
             "SELECT payload_json FROM cloud_outbox ORDER BY source_table"
         ).fetchall()
         conn.close()
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 1)
         payloads = [json.loads(row[0]) for row in rows]
-        self.assertEqual({p["memory"]["kind"] for p in payloads}, {"correction", "recipe"})
+        self.assertEqual({p["memory"]["kind"] for p in payloads}, {"recipe"})
         self.assertTrue(all(p["memory"]["status"] == "Candidate" for p in payloads))
         self.assertTrue(all(p["provenance"]["source_machine"] == "test-mac" for p in payloads))
         serialized = json.dumps(payloads)
         self.assertNotIn("sk-proj-12345678901234567890123456789012", serialized)
         self.assertIn("[redacted-secret]", serialized)
         self.assertNotIn("evidence_excerpt", serialized)
-        self.assertNotIn("instead of another wrapper", serialized)
+        self.assertNotIn("Use the canonical adapter", serialized)
 
     def test_baseline_skips_history_and_stages_future_rows(self):
         self.assertEqual(context_plane.cmd_baseline(), 0)
@@ -80,10 +80,10 @@ class ContextPlaneTests(unittest.TestCase):
         )
         conn.execute(
             """
-            INSERT INTO voice_signals VALUES
-              (3, 's2', 'claude', 'demo', '2026-08-03T12:00:00Z',
-               'preference', 'prefer', 'Prefer the smaller change.',
-               'Prefer the smaller change when both satisfy the contract.')
+            INSERT INTO recipes VALUES
+              ('r2', 's2', 'claude', '/demo', '2026-08-03T12:00:00Z',
+               'Prefer the smaller complete change', 'The smaller change passed',
+               'Apply the smallest change that satisfies the contract.')
             """
         )
         conn.commit()
@@ -93,7 +93,7 @@ class ContextPlaneTests(unittest.TestCase):
         payloads = conn.execute("SELECT payload_json FROM cloud_outbox").fetchall()
         conn.close()
         self.assertEqual(len(payloads), 1)
-        self.assertEqual(json.loads(payloads[0][0])["provenance"]["source_row_id"], "3")
+        self.assertEqual(json.loads(payloads[0][0])["provenance"]["source_row_id"], "r2")
 
     def test_failed_push_stays_pending_then_recovers(self):
         context_plane.cmd_stage(backfill=True)
@@ -118,7 +118,7 @@ class ContextPlaneTests(unittest.TestCase):
                 "https://context.example.test", "TEST_CONTEXT_TOKEN", 50, 2
             )
         self.assertEqual(result, 0)
-        self.assertEqual(len(delivered), 2)
+        self.assertEqual(len(delivered), 1)
         conn = sqlite3.connect(self.db_path)
         state, attempts = conn.execute(
             "SELECT state, MIN(attempts) FROM cloud_outbox"
@@ -231,6 +231,60 @@ class ContextPlaneTests(unittest.TestCase):
         )
         conn.close()
         self.assertNotIn("evidence_excerpt", cleaned["provenance"])
+
+    def test_legacy_signal_payload_is_quarantined_with_hash_only_receipt(self):
+        self.assertEqual(context_plane.cmd_stage(backfill=True), 0)
+        conn = sqlite3.connect(self.db_path)
+        serialized = conn.execute(
+            "SELECT payload_json FROM cloud_outbox WHERE source_table = 'recipes'"
+        ).fetchone()[0]
+        payload = json.loads(serialized)
+        payload["event_id"] = context_plane.stable_event_id("voice_signals", "1")
+        payload["memory"]["stable_key"] = "voice_signals:1"
+        payload["memory"]["body"] = "Verbatim transcript-derived preference."
+        payload["provenance"]["source_table"] = "voice_signals"
+        payload["provenance"]["source_row_id"] = "1"
+        payload["provenance"].pop("curation_level")
+        legacy_json = json.dumps(payload, separators=(",", ":"))
+        conn.execute(
+            """
+            INSERT INTO cloud_outbox
+                (event_id, source_table, source_row_id, payload_json)
+            VALUES (?, 'voice_signals', '1', ?)
+            """,
+            (payload["event_id"], legacy_json),
+        )
+        conn.commit()
+        conn.close()
+
+        deliver = patch.object(context_plane, "deliver")
+        with patch.dict(os.environ, {"TEST_CONTEXT_TOKEN": "secret"}), deliver as mock:
+            self.assertEqual(
+                context_plane.cmd_push(
+                    "https://context.example.test", "TEST_CONTEXT_TOKEN", 50, 1
+                ),
+                2,
+            )
+            mock.assert_not_called()
+
+        self.assertEqual(context_plane.cmd_quarantine_local_only(), 0)
+        conn = sqlite3.connect(self.db_path)
+        remaining_sources = conn.execute(
+            "SELECT source_table FROM cloud_outbox ORDER BY source_table"
+        ).fetchall()
+        receipt = conn.execute(
+            """
+            SELECT source_table, payload_sha256, reason
+            FROM cloud_outbox_quarantine
+            WHERE event_id = ?
+            """,
+            (payload["event_id"],),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(remaining_sources, [("recipes",)])
+        self.assertEqual(receipt[0], "voice_signals")
+        self.assertEqual(len(receipt[1]), 64)
+        self.assertNotIn("Verbatim", " ".join(str(value) for value in receipt))
 
 
 if __name__ == "__main__":

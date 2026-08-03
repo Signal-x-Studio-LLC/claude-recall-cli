@@ -15,8 +15,8 @@ The repository keeps its original Claude-specific name during the prototype. A r
 - Captures retained transcripts from Claude Code, Codex, and Gemini CLI through cheap `SessionEnd` hooks.
 - Extracts credential-redacted voice signals and reusable recipes into local `recall.db`.
 - Searches local memory without any cloud dependency.
-- Optionally sends only staged, redacted candidates through a durable local outbox to Cloudflare.
-- Keeps raw messages and evidence excerpts local; cloud provenance contains source identifiers only.
+- Optionally sends only manually promoted recipes through a durable local outbox to Cloudflare.
+- Keeps raw messages, mined voice signals, and evidence excerpts local; cloud provenance contains source identifiers only.
 - Exposes Approved memory to all three harnesses through one authenticated MCP server.
 - Keeps Git instructions and owning project documents authoritative.
 
@@ -126,8 +126,14 @@ Codex uses the same command under `SessionEnd` with a three-second timeout. Its 
 
 The Cloudflare layer is a private reviewed index, not a transcript warehouse and not a replacement for shared instructions.
 
+Automatic voice-signal mining is local evidence, not cloud memory. Promote a
+durable lesson with `/recall save` or the session-closeout workflow before
+staging it. Existing prototype outboxes should quarantine their old automatic
+signal payloads once; the command retains metadata-only hash receipts locally.
+
 ```bash
 python3 poe-extract.py drain-queue --include-codex --include-gemini
+python3 context-plane.py quarantine-local-only  # once for prototype outboxes
 python3 context-plane.py baseline  # once: do not upload existing history
 python3 context-plane.py stage
 with-secret 'Cloudflare recall-context-plane' \
@@ -136,7 +142,10 @@ with-secret 'Cloudflare recall-context-plane' \
 python3 context-plane.py status
 ```
 
-New records always arrive as `Candidate`. Only a human-authorized MCP call can mark one `Approved`. Normal searches default to Approved memory and omit Candidate, Contradicted, Superseded, and Stale records.
+Promoted recipes still arrive as `Candidate`: local curation makes content
+eligible to sync, while cloud review decides whether it may guide work. Only a
+human-authorized MCP call can mark one `Approved`. Normal searches default to
+Approved memory and omit Candidate, Contradicted, Superseded, and Stale records.
 
 `baseline` makes scheduled sync future-facing. Use `stage --backfill` only when you deliberately want to review historical local records in the cloud.
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Stage and deliver distilled recall records to the private context plane.
+"""Stage and deliver curated recall records to the private context plane.
 
-Raw transcripts never leave the machine. This client selects bounded candidate
-phrases and recipes from recall.db, applies credential redaction, writes them to
-a durable local outbox, and delivers idempotent batches when a network
-connection is available. Cloud provenance contains source identifiers only.
+Raw transcripts and automatically mined voice signals never leave the machine.
+This client stages manually promoted recipes from recall.db, applies credential
+redaction again, writes them to a durable local outbox, and delivers idempotent
+batches when a network connection is available. Cloud provenance contains
+source identifiers only.
 """
 
 from __future__ import annotations
@@ -26,7 +27,6 @@ from pathlib import Path
 RECALL_DB = Path(os.environ.get("RECALL_DB", Path.home() / ".claude" / "recall.db"))
 DEFAULT_TOKEN_ENV = "RECALL_CONTEXT_TOKEN"
 DEFAULT_URL_ENV = "RECALL_CONTEXT_URL"
-STAGED_SIGNAL_TYPES = ("correction", "preference", "rationale", "declaration")
 SECRET_PATTERNS = re.compile(
     r"""(
         sk-ant-api\d{2}-[A-Za-z0-9_\-]{20,}
@@ -77,6 +77,15 @@ CREATE TABLE IF NOT EXISTS context_plane_meta (
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS cloud_outbox_quarantine (
+    event_id       TEXT PRIMARY KEY,
+    source_table   TEXT NOT NULL,
+    source_row_id  TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    quarantined_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -115,36 +124,6 @@ def compact_title(text: str, fallback: str) -> str:
         return fallback
     sentence = normalized.split(". ", 1)[0]
     return sentence[:120]
-
-
-def stage_signal(row: sqlite3.Row) -> dict:
-    source_row_id = str(row["id"])
-    phrase = redact_secrets(row["phrase"] or row["message"]).strip()
-    signal_type = str(row["signal_type"])
-    return {
-        "event_id": stable_event_id("voice_signals", source_row_id),
-        "schema_version": 1,
-        "event_type": "memory_candidate",
-        "occurred_at": row["timestamp"] or utc_now(),
-        "memory": {
-            "stable_key": f"voice_signals:{source_row_id}",
-            "kind": signal_type,
-            "title": compact_title(phrase, signal_type.replace("_", " ").title()),
-            "body": phrase[:2000],
-            "project": row["project"],
-            "status": "Candidate",
-            "confidence": 0.55,
-        },
-        "provenance": {
-            "source_table": "voice_signals",
-            "source_row_id": source_row_id,
-            "source_client": row["source_client"] or "claude",
-            "source_machine": machine_id(),
-            "session_id": row["session_id"],
-            "source_timestamp": row["timestamp"],
-            "signal_label": row["label"],
-        },
-    }
 
 
 def stage_recipe(row: sqlite3.Row) -> dict:
@@ -258,9 +237,61 @@ def outbox_safety_counts(conn: sqlite3.Connection) -> tuple[int, int]:
         if not isinstance(provenance, dict):
             invalid_json += 1
             continue
-        if RAW_PROVENANCE_FIELDS.intersection(provenance):
+        if (
+            RAW_PROVENANCE_FIELDS.intersection(provenance)
+            or provenance.get("source_table") != "recipes"
+            or provenance.get("curation_level") != "manual_recipe"
+        ):
             unsafe += 1
     return unsafe, invalid_json
+
+
+def quarantine_local_only_payloads(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Move pending non-recipe payloads to a metadata-only local receipt table."""
+    quarantined = 0
+    invalid_json = 0
+    rows = conn.execute(
+        """
+        SELECT event_id, source_table, source_row_id, payload_json
+        FROM cloud_outbox
+        WHERE state = 'pending'
+        ORDER BY event_id
+        """
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            invalid_json += 1
+            continue
+        provenance = payload.get("provenance")
+        if not isinstance(provenance, dict):
+            invalid_json += 1
+            continue
+        if (
+            provenance.get("source_table") == "recipes"
+            and provenance.get("curation_level") == "manual_recipe"
+        ):
+            continue
+        payload_sha256 = hashlib.sha256(row["payload_json"].encode()).hexdigest()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO cloud_outbox_quarantine
+                (event_id, source_table, source_row_id, payload_sha256, reason)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                row["event_id"],
+                row["source_table"],
+                row["source_row_id"],
+                payload_sha256,
+                "automatic transcript-derived signal is local-only",
+            ),
+        )
+        conn.execute("DELETE FROM cloud_outbox WHERE event_id = ?", (row["event_id"],))
+        quarantined += 1
+    conn.commit()
+    return quarantined, invalid_json
 
 
 def table_cursor(conn: sqlite3.Connection, table: str) -> int:
@@ -275,10 +306,10 @@ def has_stage_cursors(conn: sqlite3.Connection) -> bool:
     count = conn.execute(
         """
         SELECT COUNT(*) FROM context_plane_meta
-        WHERE key IN ('stage_cursor:voice_signals', 'stage_cursor:recipes')
+        WHERE key = 'stage_cursor:recipes'
         """
     ).fetchone()[0]
-    return count == 2
+    return count == 1
 
 
 def max_rowid(conn: sqlite3.Connection, table: str) -> int:
@@ -313,7 +344,6 @@ def cmd_baseline() -> int:
     """Treat existing local records as history; future stage runs start after them."""
     conn = connect()
     cursors = {
-        "voice_signals": max_rowid(conn, "voice_signals"),
         "recipes": max_rowid(conn, "recipes"),
     }
     for table, cursor in cursors.items():
@@ -324,7 +354,7 @@ def cmd_baseline() -> int:
     return 0
 
 
-def cmd_stage(include_approvals: bool = False, backfill: bool = False) -> int:
+def cmd_stage(backfill: bool = False) -> int:
     conn = connect()
     sanitized, invalid_json = sanitize_outbox_payloads(conn)
     if invalid_json:
@@ -349,29 +379,8 @@ def cmd_stage(include_approvals: bool = False, backfill: bool = False) -> int:
             file=sys.stderr,
         )
         return 2
-    signal_types = list(STAGED_SIGNAL_TYPES)
-    if include_approvals:
-        signal_types.append("approval")
-    placeholders = ",".join("?" for _ in signal_types)
     staged = 0
     try:
-        signal_floor = 0 if backfill else table_cursor(conn, "voice_signals")
-        signal_ceiling = max_rowid(conn, "voice_signals")
-        signal_rows = []
-        if table_exists(conn, "voice_signals"):
-            signal_rows = conn.execute(
-                f"""
-                SELECT id, session_id, source_client, project, timestamp,
-                       signal_type, label, phrase, message
-                FROM voice_signals
-                WHERE rowid > ? AND signal_type IN ({placeholders})
-                ORDER BY id
-                """,
-                [signal_floor, *signal_types],
-            ).fetchall()
-        for row in signal_rows:
-            staged += int(insert_outbox(conn, stage_signal(row)))
-
         recipe_floor = 0 if backfill else table_cursor(conn, "recipes")
         recipe_ceiling = max_rowid(conn, "recipes")
         recipe_rows = []
@@ -395,7 +404,6 @@ def cmd_stage(include_approvals: bool = False, backfill: bool = False) -> int:
         for row in recipe_rows:
             staged += int(insert_outbox(conn, stage_recipe(row)))
         if not backfill:
-            save_cursor(conn, "voice_signals", signal_ceiling)
             save_cursor(conn, "recipes", recipe_ceiling)
         conn.commit()
     finally:
@@ -486,7 +494,10 @@ def cmd_push(url: str | None, token_env: str, limit: int, timeout: float) -> int
                     "sent": 0,
                     "unsafe_payloads": unsafe,
                     "invalid_outbox_payloads": invalid_json,
-                    "error": "run context-plane.py sanitize-outbox before push",
+                    "error": (
+                        "run context-plane.py sanitize-outbox, then "
+                        "context-plane.py quarantine-local-only before push"
+                    ),
                 }
             ),
             file=sys.stderr,
@@ -625,12 +636,16 @@ def cmd_status() -> int:
         "SELECT COUNT(*) FROM cloud_outbox WHERE state = 'pending' AND attempts > 0"
     ).fetchone()[0]
     unsafe, invalid_json = outbox_safety_counts(conn)
+    quarantined = conn.execute(
+        "SELECT COUNT(*) FROM cloud_outbox_quarantine"
+    ).fetchone()[0]
     conn.close()
     print(
         json.dumps(
             {
                 "outbox": {row["state"]: row["n"] for row in rows},
                 "retrying": failures,
+                "quarantine_receipts": quarantined,
                 "unsafe_payloads": unsafe,
                 "invalid_outbox_payloads": invalid_json,
             }
@@ -657,6 +672,28 @@ def cmd_sanitize_outbox() -> int:
     return 2 if unsafe or invalid_json or remaining_invalid else 0
 
 
+def cmd_quarantine_local_only() -> int:
+    conn = connect()
+    quarantined, invalid_json = quarantine_local_only_payloads(conn)
+    unsafe, remaining_invalid = outbox_safety_counts(conn)
+    receipt_count = conn.execute(
+        "SELECT COUNT(*) FROM cloud_outbox_quarantine"
+    ).fetchone()[0]
+    conn.close()
+    print(
+        json.dumps(
+            {
+                "quarantined": quarantined,
+                "quarantine_receipts": receipt_count,
+                "unsafe_payloads": unsafe,
+                "invalid_outbox_payloads": max(invalid_json, remaining_invalid),
+                "database": str(RECALL_DB),
+            }
+        )
+    )
+    return 2 if unsafe or invalid_json or remaining_invalid else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -666,11 +703,8 @@ def main() -> int:
         help="mark existing local records as history before enabling scheduled sync",
     )
 
-    stage = sub.add_parser("stage", help="stage new redacted signals and recipes in the local outbox")
-    stage.add_argument(
-        "--include-approvals",
-        action="store_true",
-        help="include approval phrases; omitted by default because they are high-volume",
+    stage = sub.add_parser(
+        "stage", help="stage new manually promoted recipes in the local outbox"
     )
     stage.add_argument(
         "--backfill",
@@ -695,15 +729,16 @@ def main() -> int:
         "sanitize-outbox",
         help="remove transcript-derived provenance fields from existing local payloads",
     )
+    sub.add_parser(
+        "quarantine-local-only",
+        help="replace pending automatic-signal payloads with metadata-only local receipts",
+    )
 
     args = parser.parse_args()
     if args.command == "baseline":
         return cmd_baseline()
     if args.command == "stage":
-        return cmd_stage(
-            include_approvals=args.include_approvals,
-            backfill=args.backfill,
-        )
+        return cmd_stage(backfill=args.backfill)
     if args.command == "push":
         return cmd_push(args.url, args.token_env, max(1, min(args.limit, 100)), args.timeout)
     if args.command == "verify":
@@ -712,6 +747,8 @@ def main() -> int:
         return cmd_status()
     if args.command == "sanitize-outbox":
         return cmd_sanitize_outbox()
+    if args.command == "quarantine-local-only":
+        return cmd_quarantine_local_only()
     return 2
 
 
