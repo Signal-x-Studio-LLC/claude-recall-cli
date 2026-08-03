@@ -84,10 +84,27 @@ than weakened.
   quarantine receipts
 
 A read-only aggregate query found 19 older cloud `voice_signals` memories: 3
-Candidate and 16 Stale. Migration `0003_keep_voice_signals_local.sql` is
-prepared and locally tested to replace their title, body, and project content
-with a local-only marker while preserving identifiers and event history. It has
-not been applied remotely; that destructive write requires separate approval.
+Candidate and 16 Stale. After explicit operator approval, migration
+`0003_keep_voice_signals_local.sql` replaced their title, body, and project
+content with a local-only marker while preserving identifiers and event
+history.
+
+- pre-migration Time Travel bookmark:
+  `0000000f-00000000-000050bc-11fcf8b6c780121d4a93d0c5894d2bb1`
+- voice-signal rows: 19
+- fully redacted rows: 19
+- mismatches: 0
+- `content_redacted` audit events: 19
+- FTS rows matching the replacement marker: 19
+- curated recipe rows after migration: 2 Candidate and 1 Stale
+- verification query effect: zero rows written
+- current R2 snapshot: 76 bytes, zero memories, zero voice-signal sources, and
+  zero transcript-derived fields
+- R2 SHA-256:
+  `7527c49d4a16a7449758a433ededda03686d63fed198383eb9c54e0665caf627`
+
+No title, body, project, transcript, or excerpt value was returned during the
+verification. The temporary R2 download was removed afterward.
 
 ## D1 Time Travel rehearsal — 2026-08-03
 
