@@ -65,3 +65,47 @@ Wrangler `4.114.0`.
 
 No memory body, transcript text, or excerpt text was emitted during the
 verification. The temporary R2 download was removed afterward.
+
+## Recipe-only boundary redeploy — 2026-08-03
+
+Machine B then proved that removing `provenance.evidence_excerpt` was
+insufficient: older `voice_signals` payloads also copied transcript-derived
+phrases into `memory.title` and `memory.body`. The boundary was corrected rather
+than weakened.
+
+- Worker version: `83ad6b76-45ec-43fe-abc2-ba55fbc1750b`
+- Git commit: `1e7ce91ff133590df9483312bed0a2b74c0cd3d7`
+- CI run: `30823424259`, successful
+- live synthetic `voice_signals` ingest: HTTP 400 before enqueue
+- synthetic Queue/D1 effect: zero receipts and zero memories
+- accepted source contract: `source_table=recipes` with
+  `curation_level=manual_recipe`
+- local automatic signals: blocked from push and eligible for metadata-only
+  quarantine receipts
+
+A read-only aggregate query found 19 older cloud `voice_signals` memories: 3
+Candidate and 16 Stale. Migration `0003_keep_voice_signals_local.sql` is
+prepared and locally tested to replace their title, body, and project content
+with a local-only marker while preserving identifiers and event history. It has
+not been applied remotely; that destructive write requires separate approval.
+
+## D1 Time Travel rehearsal — 2026-08-03
+
+The restore gate was rehearsed against a separate remote database, never the
+live Worker binding:
+
+- database: `recall-context-recovery-20260803`
+- database ID: `c836f0df-3eca-495b-847c-d294992aed88`
+- schema: `0001_init.sql`, including FTS5 and its triggers
+- pre-mutation bookmark:
+  `00000000-0000000e-000050bc-9b8e74abe1e6ce1642bffff36284136f`
+- pre-restore bookmark returned for undo:
+  `00000000-ffffffff-000050bc-7145b35accff7385bca71c462e7261ab`
+- restored fixture count: 1
+- post-bookmark fixture count: 0
+- restored FTS match count: 1
+- verification query effect: zero rows written
+
+This proves Time Travel with the production FTS5 schema. D1 export is not part
+of the recovery path and remains unsupported while the database contains a
+virtual table.
