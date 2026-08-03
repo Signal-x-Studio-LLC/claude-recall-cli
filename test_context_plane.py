@@ -53,8 +53,8 @@ class ContextPlaneTests(unittest.TestCase):
 
     def test_stage_is_idempotent_and_omits_approvals(self):
         with patch.dict(os.environ, {"RECALL_MACHINE_ID": "test-mac"}):
-            self.assertEqual(context_plane.cmd_stage(), 0)
-            self.assertEqual(context_plane.cmd_stage(), 0)
+            self.assertEqual(context_plane.cmd_stage(backfill=True), 0)
+            self.assertEqual(context_plane.cmd_stage(backfill=True), 0)
         conn = sqlite3.connect(self.db_path)
         rows = conn.execute(
             "SELECT payload_json FROM cloud_outbox ORDER BY source_table"
@@ -94,7 +94,7 @@ class ContextPlaneTests(unittest.TestCase):
         self.assertEqual(json.loads(payloads[0][0])["provenance"]["source_row_id"], "3")
 
     def test_failed_push_stays_pending_then_recovers(self):
-        context_plane.cmd_stage()
+        context_plane.cmd_stage(backfill=True)
         with patch.dict(os.environ, {"TEST_CONTEXT_TOKEN": "secret"}), patch.object(
             context_plane, "deliver", side_effect=OSError("offline")
         ):
@@ -147,7 +147,7 @@ class ContextPlaneTests(unittest.TestCase):
         self.assertEqual(states, [("acknowledged",)])
 
     def test_missing_receipt_returns_event_to_pending(self):
-        context_plane.cmd_stage()
+        context_plane.cmd_stage(backfill=True)
         conn = sqlite3.connect(self.db_path)
         conn.execute("UPDATE cloud_outbox SET state = 'sent'")
         conn.commit()
@@ -167,6 +167,13 @@ class ContextPlaneTests(unittest.TestCase):
         self.assertEqual(
             states, [("pending", "receipt missing; retrying idempotently")]
         )
+
+    def test_stage_requires_a_baseline_or_explicit_backfill(self):
+        self.assertEqual(context_plane.cmd_stage(), 2)
+        conn = sqlite3.connect(self.db_path)
+        count = conn.execute("SELECT COUNT(*) FROM cloud_outbox").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
 
 
 if __name__ == "__main__":

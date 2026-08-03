@@ -32,8 +32,11 @@ Claude Code and Codex hook examples already use this command. For Gemini, merge 
 Before enabling the schedule, mark the current corpus as local history:
 
 ```bash
+python3 "$RECALL_CLI_DIR/poe-extract.py" drain-queue --include-codex --include-gemini
 python3 "$RECALL_CLI_DIR/context-plane.py" baseline
 ```
+
+Run these in this order. Baseline the local database only after the full three-client catch-up, or retained sessions that have not been mined yet can appear new on the first scheduled run. `stage` refuses to run without a cursor unless `--backfill` is explicit.
 
 Run the local worker on a schedule through 1Password:
 

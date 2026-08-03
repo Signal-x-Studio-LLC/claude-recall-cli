@@ -123,6 +123,7 @@ Codex uses the same command under `SessionEnd` with a three-second timeout. Its 
 The Cloudflare layer is a private reviewed index, not a transcript warehouse and not a replacement for shared instructions.
 
 ```bash
+python3 poe-extract.py drain-queue --include-codex --include-gemini
 python3 context-plane.py baseline  # once: do not upload existing history
 python3 context-plane.py stage
 with-secret 'Cloudflare recall-context-plane' \

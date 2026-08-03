@@ -200,6 +200,16 @@ def table_cursor(conn: sqlite3.Connection, table: str) -> int:
     return int(row[0]) if row else 0
 
 
+def has_stage_cursors(conn: sqlite3.Connection) -> bool:
+    count = conn.execute(
+        """
+        SELECT COUNT(*) FROM context_plane_meta
+        WHERE key IN ('stage_cursor:voice_signals', 'stage_cursor:recipes')
+        """
+    ).fetchone()[0]
+    return count == 2
+
+
 def max_rowid(conn: sqlite3.Connection, table: str) -> int:
     return int(conn.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0])
 
@@ -233,6 +243,14 @@ def cmd_baseline() -> int:
 
 def cmd_stage(include_approvals: bool = False, backfill: bool = False) -> int:
     conn = connect()
+    if not backfill and not has_stage_cursors(conn):
+        conn.close()
+        print(
+            "stage cursor missing; run the full local catch-up, then context-plane.py baseline, "
+            "or use --backfill deliberately",
+            file=sys.stderr,
+        )
+        return 2
     signal_types = list(STAGED_SIGNAL_TYPES)
     if include_approvals:
         signal_types.append("approval")

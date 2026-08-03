@@ -71,6 +71,7 @@ Then run one local sync with the secret injected:
 
 ```bash
 export RECALL_CONTEXT_URL="https://recall-context-plane.<account>.workers.dev"
+python3 ../poe-extract.py drain-queue --include-codex --include-gemini
 python3 ../context-plane.py baseline
 with-secret 'Cloudflare recall-context-plane' \
   --as RECALL_CONTEXT_TOKEN -- \
