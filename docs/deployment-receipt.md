@@ -29,3 +29,22 @@ AI normalization remains disabled. The gateway exists and the Worker binding is 
 - MCP initialization negotiated protocol `2025-11-25`, returned the five expected tools, and supplied the Git-authority and human-approval instructions.
 
 The synthetic record was preserved as Stale instead of deleted, so the status transition and provenance remain inspectable.
+
+## Privacy-boundary redeploy — 2026-08-03
+
+Machine B proved that the original client copied whole local messages into
+`provenance.evidence_excerpt`. The forward guard was deployed before allowing
+another field push:
+
+- Worker version: `92707d40-85e6-41d6-ad2d-bdd2ef804ae0`
+- `/health`: HTTP 200 with the same version ID and its creation timestamp
+- synthetic ingest with `evidence_excerpt`: HTTP 400, rejected as an
+  unrecognized provenance key
+- synthetic payload: no real session content and no credential-shaped value
+- Queue/D1 effect: none; validation rejected the event before enqueue
+
+The deployed Worker now rejects stale clients that send transcript-derived
+provenance. Existing D1 data is unchanged: 17 `voice_signals` rows still contain
+the old excerpt field. Migration `0002_remove_raw_provenance.sql` is prepared
+and locally tested, but applying that destructive redaction remotely requires
+separate approval and a recovery receipt.
