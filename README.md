@@ -123,6 +123,7 @@ Codex uses the same command under `SessionEnd` with a three-second timeout. Its 
 The Cloudflare layer is a private reviewed index, not a transcript warehouse and not a replacement for shared instructions.
 
 ```bash
+python3 context-plane.py baseline  # once: do not upload existing history
 python3 context-plane.py stage
 with-secret 'Cloudflare recall-context-plane' \
   --as RECALL_CONTEXT_TOKEN -- \
@@ -131,6 +132,8 @@ python3 context-plane.py status
 ```
 
 New records always arrive as `Candidate`. Only a human-authorized MCP call can mark one `Approved`. Normal searches default to Approved memory and omit Candidate, Contradicted, Superseded, and Stale records.
+
+`baseline` makes scheduled sync future-facing. Use `stage --backfill` only when you deliberately want to review historical local records in the cloud.
 
 Read these in order:
 

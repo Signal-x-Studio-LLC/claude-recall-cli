@@ -29,6 +29,12 @@ python3 ~/Workspace/dev/tools/claude-recall-cli/poe-extract.py enqueue
 
 Claude Code and Codex hook examples already use this command. For Gemini, merge `adapters/gemini-settings.json` into `~/.gemini/settings.json`. Gemini supplies `session_id`, `transcript_path`, and `cwd` on stdin; its hook is best effort, so the scheduled catch-up sweep remains necessary.
 
+Before enabling the schedule, mark the current corpus as local history:
+
+```bash
+python3 "$RECALL_CLI_DIR/context-plane.py" baseline
+```
+
 Run the local worker on a schedule through 1Password:
 
 ```bash
@@ -38,6 +44,8 @@ with-secret 'Cloudflare recall-context-plane' \
 ```
 
 That command drains queued Claude, Codex, and Gemini sessions, stages redacted candidates, verifies prior receipts, and pushes the next pending batch. An offline push leaves the batch in SQLite for the next run.
+
+To review historical records in the cloud, run `context-plane.py stage --backfill` explicitly. Scheduled sync never backfills on its own after the baseline cursor exists.
 
 ## Codex MCP
 

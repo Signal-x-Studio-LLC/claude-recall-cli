@@ -69,6 +69,30 @@ class ContextPlaneTests(unittest.TestCase):
         self.assertNotIn("sk-proj-12345678901234567890123456789012", serialized)
         self.assertIn("[redacted-secret]", serialized)
 
+    def test_baseline_skips_history_and_stages_future_rows(self):
+        self.assertEqual(context_plane.cmd_baseline(), 0)
+        self.assertEqual(context_plane.cmd_stage(), 0)
+        conn = sqlite3.connect(self.db_path)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM cloud_outbox").fetchone()[0], 0
+        )
+        conn.execute(
+            """
+            INSERT INTO voice_signals VALUES
+              (3, 's2', 'claude', 'demo', '2026-08-03T12:00:00Z',
+               'preference', 'prefer', 'Prefer the smaller change.',
+               'Prefer the smaller change when both satisfy the contract.')
+            """
+        )
+        conn.commit()
+        conn.close()
+        self.assertEqual(context_plane.cmd_stage(), 0)
+        conn = sqlite3.connect(self.db_path)
+        payloads = conn.execute("SELECT payload_json FROM cloud_outbox").fetchall()
+        conn.close()
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(json.loads(payloads[0][0])["provenance"]["source_row_id"], "3")
+
     def test_failed_push_stays_pending_then_recovers(self):
         context_plane.cmd_stage()
         with patch.dict(os.environ, {"TEST_CONTEXT_TOKEN": "secret"}), patch.object(

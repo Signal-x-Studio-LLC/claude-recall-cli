@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS cloud_outbox (
 
 CREATE INDEX IF NOT EXISTS idx_cloud_outbox_state_created
 ON cloud_outbox(state, created_at);
+
+CREATE TABLE IF NOT EXISTS context_plane_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -186,7 +192,46 @@ def insert_outbox(conn: sqlite3.Connection, payload: dict) -> bool:
     return cur.rowcount > 0
 
 
-def cmd_stage(include_approvals: bool = False) -> int:
+def table_cursor(conn: sqlite3.Connection, table: str) -> int:
+    row = conn.execute(
+        "SELECT value FROM context_plane_meta WHERE key = ?",
+        (f"stage_cursor:{table}",),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def max_rowid(conn: sqlite3.Connection, table: str) -> int:
+    return int(conn.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0])
+
+
+def save_cursor(conn: sqlite3.Connection, table: str, cursor: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO context_plane_meta(key, value, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value, updated_at = datetime('now')
+        """,
+        (f"stage_cursor:{table}", str(cursor)),
+    )
+
+
+def cmd_baseline() -> int:
+    """Treat existing local records as history; future stage runs start after them."""
+    conn = connect()
+    cursors = {
+        "voice_signals": max_rowid(conn, "voice_signals"),
+        "recipes": max_rowid(conn, "recipes"),
+    }
+    for table, cursor in cursors.items():
+        save_cursor(conn, table, cursor)
+    conn.commit()
+    conn.close()
+    print(json.dumps({"baselined": cursors, "database": str(RECALL_DB)}))
+    return 0
+
+
+def cmd_stage(include_approvals: bool = False, backfill: bool = False) -> int:
     conn = connect()
     signal_types = list(STAGED_SIGNAL_TYPES)
     if include_approvals:
@@ -194,15 +239,17 @@ def cmd_stage(include_approvals: bool = False) -> int:
     placeholders = ",".join("?" for _ in signal_types)
     staged = 0
     try:
+        signal_floor = 0 if backfill else table_cursor(conn, "voice_signals")
+        signal_ceiling = max_rowid(conn, "voice_signals")
         signal_rows = conn.execute(
             f"""
             SELECT id, session_id, source_client, project, timestamp,
                    signal_type, label, phrase, message
             FROM voice_signals
-            WHERE signal_type IN ({placeholders})
+            WHERE rowid > ? AND signal_type IN ({placeholders})
             ORDER BY id
             """,
-            signal_types,
+            [signal_floor, *signal_types],
         ).fetchall()
         for row in signal_rows:
             staged += int(insert_outbox(conn, stage_signal(row)))
@@ -211,16 +258,23 @@ def cmd_stage(include_approvals: bool = False) -> int:
             row[1] for row in conn.execute("PRAGMA table_info(recipes)").fetchall()
         }
         source_expr = "source_client" if "source_client" in recipe_columns else "'claude'"
+        recipe_floor = 0 if backfill else table_cursor(conn, "recipes")
+        recipe_ceiling = max_rowid(conn, "recipes")
         recipe_rows = conn.execute(
             f"""
             SELECT id, session_id, {source_expr} AS source_client, project_path,
                    created_at, intent, outcome, prompt_template
             FROM recipes
+            WHERE rowid > ?
             ORDER BY created_at
-            """
+            """,
+            (recipe_floor,),
         ).fetchall()
         for row in recipe_rows:
             staged += int(insert_outbox(conn, stage_recipe(row)))
+        if not backfill:
+            save_cursor(conn, "voice_signals", signal_ceiling)
+            save_cursor(conn, "recipes", recipe_ceiling)
         conn.commit()
     finally:
         conn.close()
@@ -438,11 +492,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
-    stage = sub.add_parser("stage", help="stage redacted signals and recipes in the local outbox")
+    sub.add_parser(
+        "baseline",
+        help="mark existing local records as history before enabling scheduled sync",
+    )
+
+    stage = sub.add_parser("stage", help="stage new redacted signals and recipes in the local outbox")
     stage.add_argument(
         "--include-approvals",
         action="store_true",
         help="include approval phrases; omitted by default because they are high-volume",
+    )
+    stage.add_argument(
+        "--backfill",
+        action="store_true",
+        help="deliberately stage historical rows before the saved cursor",
     )
 
     push = sub.add_parser("push", help="deliver one retryable outbox batch")
@@ -460,8 +524,13 @@ def main() -> int:
     sub.add_parser("status", help="show pending and delivered outbox counts")
 
     args = parser.parse_args()
+    if args.command == "baseline":
+        return cmd_baseline()
     if args.command == "stage":
-        return cmd_stage(include_approvals=args.include_approvals)
+        return cmd_stage(
+            include_approvals=args.include_approvals,
+            backfill=args.backfill,
+        )
     if args.command == "push":
         return cmd_push(args.url, args.token_env, max(1, min(args.limit, 100)), args.timeout)
     if args.command == "verify":

@@ -71,6 +71,7 @@ Then run one local sync with the secret injected:
 
 ```bash
 export RECALL_CONTEXT_URL="https://recall-context-plane.<account>.workers.dev"
+python3 ../context-plane.py baseline
 with-secret 'Cloudflare recall-context-plane' \
   --as RECALL_CONTEXT_TOKEN -- \
   ../adapters/sync-context-plane.sh
@@ -112,4 +113,3 @@ with-secret 'Cloudflare recall-context-plane' \
   --as RECALL_CONTEXT_TOKEN -- \
   /bin/zsh -lc 'curl -fsS -X POST -H "Authorization: Bearer $RECALL_CONTEXT_TOKEN" "$RECALL_CONTEXT_URL/admin/snapshot"'
 ```
-
