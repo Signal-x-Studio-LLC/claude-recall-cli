@@ -23,6 +23,7 @@ export interface Env {
   AI_MODEL: string;
   ENABLE_AI_DISTILLATION: string;
   RECEIPT_RETENTION_DAYS: string;
+  CF_VERSION_METADATA: WorkerVersionMetadata;
 }
 
 interface MemoryRow {
@@ -567,7 +568,15 @@ const worker: ExportedHandler<Env, CandidateEvent> = {
   async fetch(request, env, ctx): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
-      return json({ ok: true, service: "recall-context-plane" });
+      return json({
+        ok: true,
+        service: "recall-context-plane",
+        version: {
+          id: env.CF_VERSION_METADATA.id,
+          tag: env.CF_VERSION_METADATA.tag,
+          timestamp: env.CF_VERSION_METADATA.timestamp,
+        },
+      });
     }
     if (request.method === "POST" && url.pathname === "/ingest") {
       return handleIngest(request, env);

@@ -38,6 +38,18 @@ describe("context plane domain", () => {
     ).toThrow();
   });
 
+  it("rejects transcript-derived provenance excerpts", () => {
+    expect(() =>
+      CandidateEventSchema.parse({
+        ...event,
+        provenance: {
+          ...event.provenance,
+          evidence_excerpt: "verbatim prompt text must stay local",
+        },
+      }),
+    ).toThrow();
+  });
+
   it("rejects credential-shaped values at the server boundary", () => {
     expect(() =>
       CandidateEventSchema.parse({

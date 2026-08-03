@@ -16,6 +16,7 @@ The repository keeps its original Claude-specific name during the prototype. A r
 - Extracts credential-redacted voice signals and reusable recipes into local `recall.db`.
 - Searches local memory without any cloud dependency.
 - Optionally sends only staged, redacted candidates through a durable local outbox to Cloudflare.
+- Keeps raw messages and evidence excerpts local; cloud provenance contains source identifiers only.
 - Exposes Approved memory to all three harnesses through one authenticated MCP server.
 - Keeps Git instructions and owning project documents authoritative.
 

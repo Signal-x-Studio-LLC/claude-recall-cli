@@ -2,7 +2,9 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA = Path(__file__).parent / "cloudflare" / "migrations" / "0001_init.sql"
+MIGRATIONS = Path(__file__).parent / "cloudflare" / "migrations"
+SCHEMA = MIGRATIONS / "0001_init.sql"
+PRIVACY_MIGRATION = MIGRATIONS / "0002_remove_raw_provenance.sql"
 
 
 def test_cloudflare_schema_enforces_state_and_fts_contracts():
@@ -19,7 +21,7 @@ def test_cloudflare_schema_enforces_state_and_fts_contracts():
         "test-mac",
         "s1",
         "2026-08-02T20:00:00Z",
-        "{}",
+        '{"source_table":"voice_signals","evidence_excerpt":"verbatim prompt"}',
     )
     conn.execute(
         """
@@ -63,4 +65,24 @@ def test_cloudflare_schema_enforces_state_and_fts_contracts():
         pass
     else:
         raise AssertionError("duplicate stable key bypassed idempotency constraint")
+
+    conn.executescript(PRIVACY_MIGRATION.read_text())
+    provenance, event_type, payload = conn.execute(
+        """
+        SELECT m.provenance_json, e.event_type, e.payload_json
+        FROM memories m
+        JOIN memory_events e ON e.memory_id = m.id
+        WHERE m.id = ? AND e.event_type = 'provenance_redacted'
+        """,
+        (values[0],),
+    ).fetchone()
+    assert "evidence_excerpt" not in provenance
+    assert event_type == "provenance_redacted"
+    assert '"removed_excerpt_chars":15' in payload
+
+    # The migration is safe to replay locally while testing recovery.
+    conn.executescript(PRIVACY_MIGRATION.read_text())
+    assert conn.execute(
+        "SELECT COUNT(*) FROM memory_events WHERE event_type = 'provenance_redacted'"
+    ).fetchone() == (1,)
     conn.close()

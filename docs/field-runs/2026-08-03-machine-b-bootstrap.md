@@ -1,6 +1,6 @@
-# Machine B bootstrap audit — 2026-08-03
+# Machine B partial field run — 2026-08-03
 
-Status: **audit only**. Machine B was not configured as an ingest client during this run.
+Status: **partial, stopped before push**. Machine B staged local candidates but sent nothing to D1, R2, or the Queue.
 
 ## What the audit established
 
@@ -39,4 +39,25 @@ portable `tools/...` and `apps/...` labels. The branch now normalizes canonical
 `Workspace` paths independently of the ingest machine's home and includes a
 `/Users/nino.chavez/...` regression case.
 
-This audit does not satisfy any multi-machine ingest requirement. Machine B still needs its own durable outbox, three connected harnesses, real processed candidates, storage baseline, and retention report.
+The initial bootstrap audit did not satisfy any multi-machine ingest requirement. The partial run below supersedes that limited status, but it still does not satisfy the release gate.
+
+## Partial-run follow-up
+
+Machine B later completed the local portion of the run at `c8f66df` and posted
+the canonical receipts to [issue #3](https://github.com/nino-chavez/claude-recall-cli/issues/3):
+
+- [partial receipts](https://github.com/nino-chavez/claude-recall-cli/issues/3#issuecomment-5166946365)
+- [seven blockers](https://github.com/nino-chavez/claude-recall-cli/issues/3#issuecomment-5166962203)
+
+The run proved cross-machine label portability, three-client local catch-up,
+durable staging, authentication rejection, credential-shaped payload rejection,
+and per-artifact byte counts. It stopped with 94 pending local candidates after
+proving that every staged `provenance.evidence_excerpt` was byte-identical to
+the local raw message. Nothing was pushed.
+
+The remaining findings were a fresh-database baseline crash when `recipes` was
+absent, a missing-archive exception in the retention report, a swallowed stack
+rebuild failure, sparse real Gemini signals, the `chats` Gemini fallback label,
+the Machine-A-specific encoded-path fallback, and the lack of a self-serve
+Worker version in `/health`. Human review and the remaining multi-machine gates
+were deliberately left open.

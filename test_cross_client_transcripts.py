@@ -35,6 +35,25 @@ def test_project_labels_are_portable_across_machine_homes():
     assert poe._cwd_to_label("/Users/nino.chavez/Documents/notes") == "Documents/notes"
 
 
+def test_project_label_fallbacks_do_not_encode_machine_home(tmp_path):
+    encoded_dir = tmp_path / "-Users-nino-chavez-Workspace-dev-wip-example"
+    encoded_dir.mkdir()
+    claude_transcript = _write_jsonl(
+        encoded_dir / "session.jsonl",
+        [{"type": "user", "message": {"content": "No cwd in this fixture."}}],
+    )
+    assert poe.project_label_for(claude_transcript) == "wip-example"
+
+    project_hash = "a" * 64
+    chats_dir = tmp_path / project_hash / "chats"
+    chats_dir.mkdir(parents=True)
+    gemini_transcript = chats_dir / "session.json"
+    gemini_transcript.write_text(
+        json.dumps({"sessionId": "g1", "messages": []})
+    )
+    assert poe.project_label_for(gemini_transcript) == f"gemini/{project_hash[:12]}"
+
+
 def test_codex_uses_event_messages_and_ignores_injected_user_context(tmp_path):
     session_id = "019fc4a9-f447-70e2-9ab6-746e66cfe97f"
     transcript = _write_jsonl(
@@ -303,14 +322,13 @@ def test_retention_report_only_covers_unchanged_archived_files_after_grace(tmp_p
     assert [item["path"] for item in report["covered_files"]] == [str(covered)]
 
 
-def test_retention_report_fails_closed_for_missing_archive_or_bad_grace(tmp_path):
+def test_retention_report_returns_zero_for_missing_archive_and_rejects_bad_grace(tmp_path):
     conn = _retention_conn()
 
-    try:
-        poe.build_retention_report(conn, tmp_path / "missing")
-        assert False, "missing archive directory should fail"
-    except FileNotFoundError:
-        pass
+    report = poe.build_retention_report(conn, tmp_path / "missing")
+    assert report["archive_exists"] is False
+    assert report["scanned_files"] == 0
+    assert report["deletion_authorized"] is False
 
     archive = tmp_path / "archived_sessions"
     archive.mkdir()
@@ -319,3 +337,37 @@ def test_retention_report_fails_closed_for_missing_archive_or_bad_grace(tmp_path
         assert False, "negative grace should fail"
     except ValueError:
         pass
+
+
+def test_assemble_creates_missing_output_directory(tmp_path):
+    old_db = poe.RECALL_DB
+    old_poe_dir = poe.POE_DIR
+    old_stack = poe.STACK_PATH
+    old_corpus = poe.CORPUS_PATH
+    poe.RECALL_DB = tmp_path / "recall.db"
+    poe.POE_DIR = tmp_path / "poe"
+    poe.STACK_PATH = poe.POE_DIR / "stack.md"
+    poe.CORPUS_PATH = poe.POE_DIR / "corpus.jsonl"
+    try:
+        conn = poe.db_connect()
+        conn.execute(
+            """
+            INSERT INTO voice_signals
+                (session_id, source_client, project, timestamp, signal_type,
+                 label, phrase, message, prior_assistant, phrase_hash)
+            VALUES (?, 'codex', 'tools/recall', '2026-08-03T12:00:00Z',
+                    'preference', 'prefer', ?, ?, '', ?)
+            """,
+            ("s1", "Prefer portable paths across machines.",
+             "Prefer portable paths across machines.", "hash-1"),
+        )
+        conn.commit()
+        conn.close()
+
+        poe.cmd_assemble(_skip_catchup=True)
+        assert poe.STACK_PATH.exists()
+    finally:
+        poe.RECALL_DB = old_db
+        poe.POE_DIR = old_poe_dir
+        poe.STACK_PATH = old_stack
+        poe.CORPUS_PATH = old_corpus

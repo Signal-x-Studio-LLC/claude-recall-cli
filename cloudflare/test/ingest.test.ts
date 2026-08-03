@@ -92,6 +92,26 @@ describe("ingest boundary", () => {
     expect(queued).toHaveLength(0);
   });
 
+  it("rejects transcript-derived provenance excerpts", async () => {
+    const { env, queued } = fakeEnv();
+    const response = await handleIngest(
+      request("correct-token", {
+        events: [
+          {
+            ...candidate,
+            provenance: {
+              ...candidate.provenance,
+              evidence_excerpt: "verbatim prompt text must stay local",
+            },
+          },
+        ],
+      }),
+      env,
+    );
+    expect(response.status).toBe(400);
+    expect(queued).toHaveLength(0);
+  });
+
   it("does not requeue an event with a processed receipt", async () => {
     const { env, queued } = fakeEnv("processed");
     const response = await handleIngest(

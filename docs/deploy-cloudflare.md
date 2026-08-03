@@ -64,7 +64,7 @@ curl -fsS "https://recall-context-plane.<account>.workers.dev/health"
 Expected health response:
 
 ```json
-{"ok":true,"service":"recall-context-plane"}
+{"ok":true,"service":"recall-context-plane","version":{"id":"<worker-version-id>","tag":"<tag>","timestamp":"<created-at>"}}
 ```
 
 Then run one local sync with the secret injected:
@@ -73,6 +73,7 @@ Then run one local sync with the secret injected:
 export RECALL_CONTEXT_URL="https://recall-context-plane.<account>.workers.dev"
 python3 ../poe-extract.py drain-queue --include-codex --include-gemini
 python3 ../context-plane.py baseline
+python3 ../context-plane.py sanitize-outbox
 with-secret 'Cloudflare recall-context-plane' \
   --as RECALL_CONTEXT_TOKEN -- \
   ../adapters/sync-context-plane.sh
@@ -85,6 +86,8 @@ python3 ../context-plane.py status
 ```
 
 An event moves `pending` → `sent` → `acknowledged`. A `sent` item is waiting for a Queue receipt; it is not yet proof that D1 contains the memory.
+
+The outbox status must show `unsafe_payloads: 0` before push. The Worker rejects transcript-derived provenance excerpts even if an older client tries to send one.
 
 ## 5. Enable AI Gateway only after the deterministic path passes
 
@@ -106,6 +109,7 @@ Normalization can change `title`, `body`, `kind`, and `confidence`. It cannot ch
 - Candidate and Approved records become Stale only when they have an explicit `expires_at` date.
 - Queue delivery is at least once. Stable IDs and unique constraints make replay safe.
 - Raw transcripts remain local and follow the local watermark plus archive-grace policy.
+- Migration `0002_remove_raw_provenance.sql` removes the prototype's old `evidence_excerpt` field and writes a non-content audit event. On an existing deployment, record a recovery bookmark and obtain approval before applying that destructive redaction remotely.
 
 Trigger a snapshot after the first Approved record:
 

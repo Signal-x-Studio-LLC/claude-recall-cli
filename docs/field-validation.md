@@ -14,7 +14,7 @@ The public tutorial and interactive demo can explain the architecture and its tr
 - A superseded memory points to its replacement and preserves both event histories.
 - A D1 Time Travel restore is rehearsed without overwriting the live database.
 - An R2 snapshot is regenerated from D1 and compared with the Approved row count.
-- Credential-shaped test payloads are rejected, and no raw transcript fields appear in D1 or R2.
+- Credential-shaped test payloads are rejected. D1 and R2 may contain the bounded, credential-redacted candidate body, but never a raw transcript, whole raw message, assistant response, or transcript-derived provenance excerpt.
 - Both machines record separate before-and-after byte counts for raw transcripts, `recall.db`, the durable outbox, and linked-worktree build output. A total workspace size is not accepted as a memory-growth measurement.
 - A retention dry run lists only archived transcripts whose exact path and modification time are covered by the ingest watermark. Active transcripts and unpromoted evidence remain ineligible for deletion.
 - D1 and R2 storage are recorded after the field run so the release notes can state measured cloud growth instead of projecting from local transcript volume.
@@ -45,6 +45,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q
 python3 poe-extract.py drain-queue --include-codex --include-gemini
 python3 context-plane.py baseline
 python3 poe-extract.py retention-report --grace-days 7
+python3 context-plane.py sanitize-outbox
+python3 context-plane.py status
 
 with-secret 'Cloudflare recall-context-plane' \
   --as RECALL_CONTEXT_TOKEN -- \
@@ -52,6 +54,12 @@ with-secret 'Cloudflare recall-context-plane' \
 ```
 
 Baseline only on a machine that has never synced this local database. On a previously initialized machine, omit `baseline`; running it again would hide unsent local records by moving the cursor.
+
+Before any push, `status` must report both `unsafe_payloads: 0` and `invalid_outbox_payloads: 0`. The Worker independently rejects `provenance.evidence_excerpt` and other extra provenance fields. Existing prototype outboxes must run `sanitize-outbox` once before retrying.
+
+Read `/health` from the deployed Worker and record `version.id`; the response is the cross-machine deployment receipt and does not require Wrangler on the client machine.
+
+If retained Gemini sessions contain fewer than five candidate-worthy human signals, complete real work in Gemini until five exist. Re-running the same watermark sweep cannot create evidence, and synthetic human preferences do not satisfy this gate.
 
 Install the three client adapters from `adapters/`, then perform the retrieval checks in [Connect Claude, Codex, and Gemini](connect-clients.md). A configuration listing is not a connection receipt. Record the client's connected status and the returned memory ID without copying retrieved text into the receipt.
 
@@ -74,4 +82,4 @@ Do not delete anything during field validation. The retention report always retu
 ## Current field runs
 
 - [Machine A — 2026-08-03](field-runs/2026-08-03-machine-a.md): local baseline and retention receipt; multi-machine gate remains open.
-- [Machine B bootstrap audit — 2026-08-03](field-runs/2026-08-03-machine-b-bootstrap.md): portable-path and CI gaps identified; this is not an ingest receipt.
+- [Machine B partial run — 2026-08-03](field-runs/2026-08-03-machine-b-bootstrap.md): portable labels and local staging measured; stopped before push on a privacy violation.

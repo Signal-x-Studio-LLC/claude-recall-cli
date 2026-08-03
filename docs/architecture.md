@@ -29,9 +29,9 @@ flowchart LR
 
 ## What crosses the network
 
-Only staged `voice_signals` and manually saved `recipes` cross the network. The client applies credential redaction again before writing the outbox. The Worker rejects extra transcript-shaped fields and known credential shapes. Raw session transcripts stay on the machine where they were created.
+Only staged `voice_signals` and manually saved `recipes` cross the network. The candidate body is the bounded phrase or recipe selected by the local miner, with credential redaction applied again before writing the outbox. Raw messages, assistant responses, transcript fields, and evidence excerpts stay on the machine where they were created.
 
-Each candidate carries its source client, machine, session ID, source timestamp, and local row ID. Stable event IDs make retries safe. A local item is not complete when the Worker accepts it; it becomes `acknowledged` only after the Queue consumer records a processed receipt.
+Cloud provenance contains identifiers only: source client, machine, session ID, source timestamp, local table, and local row ID. The Worker rejects transcript-derived provenance fields. Stable event IDs make retries safe. A local item is not complete when the Worker accepts it; it becomes `acknowledged` only after the Queue consumer records a processed receipt.
 
 ## Memory states
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Stage and deliver distilled recall records to the private context plane.
 
-Raw transcripts never leave the machine. This client reads already-redacted
-records from recall.db, writes them to a durable local outbox, and delivers
-idempotent batches when a network connection is available.
+Raw transcripts never leave the machine. This client selects bounded candidate
+phrases and recipes from recall.db, applies credential redaction, writes them to
+a durable local outbox, and delivers idempotent batches when a network
+connection is available. Cloud provenance contains source identifiers only.
 """
 
 from __future__ import annotations
@@ -43,6 +44,14 @@ SECRET_PATTERNS = re.compile(
     re.VERBOSE,
 )
 REDACTION = "[redacted-secret]"
+RAW_PROVENANCE_FIELDS = {
+    "evidence_excerpt",
+    "message",
+    "prior_assistant",
+    "raw_transcript",
+    "response_text",
+    "transcript",
+}
 
 
 OUTBOX_SCHEMA = """
@@ -134,7 +143,6 @@ def stage_signal(row: sqlite3.Row) -> dict:
             "session_id": row["session_id"],
             "source_timestamp": row["timestamp"],
             "signal_label": row["label"],
-            "evidence_excerpt": redact_secrets(row["message"] or phrase)[:1200],
         },
     }
 
@@ -192,6 +200,69 @@ def insert_outbox(conn: sqlite3.Connection, payload: dict) -> bool:
     return cur.rowcount > 0
 
 
+def sanitize_outbox_payloads(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Remove raw-evidence fields from existing local outbox payloads.
+
+    Older clients staged `provenance.evidence_excerpt` before the cloud privacy
+    contract was enforced. Keep the stable event and source identifiers, but
+    remove transcript-derived evidence before any retry can cross the network.
+    Returns `(sanitized, invalid_json)`.
+    """
+    sanitized = 0
+    invalid_json = 0
+    rows = conn.execute(
+        "SELECT event_id, payload_json FROM cloud_outbox ORDER BY event_id"
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            invalid_json += 1
+            continue
+        provenance = payload.get("provenance")
+        if not isinstance(provenance, dict):
+            invalid_json += 1
+            continue
+        removed = False
+        for field in RAW_PROVENANCE_FIELDS:
+            if field in provenance:
+                del provenance[field]
+                removed = True
+        if not removed:
+            continue
+        conn.execute(
+            "UPDATE cloud_outbox SET payload_json = ? WHERE event_id = ?",
+            (
+                json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+                row["event_id"],
+            ),
+        )
+        sanitized += 1
+    conn.commit()
+    return sanitized, invalid_json
+
+
+def outbox_safety_counts(conn: sqlite3.Connection) -> tuple[int, int]:
+    unsafe = 0
+    invalid_json = 0
+    rows = conn.execute(
+        "SELECT payload_json FROM cloud_outbox WHERE state != 'acknowledged'"
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            invalid_json += 1
+            continue
+        provenance = payload.get("provenance")
+        if not isinstance(provenance, dict):
+            invalid_json += 1
+            continue
+        if RAW_PROVENANCE_FIELDS.intersection(provenance):
+            unsafe += 1
+    return unsafe, invalid_json
+
+
 def table_cursor(conn: sqlite3.Connection, table: str) -> int:
     row = conn.execute(
         "SELECT value FROM context_plane_meta WHERE key = ?",
@@ -211,7 +282,19 @@ def has_stage_cursors(conn: sqlite3.Connection) -> bool:
 
 
 def max_rowid(conn: sqlite3.Connection, table: str) -> int:
+    if not table_exists(conn, table):
+        return 0
     return int(conn.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0])
+
+
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
 
 
 def save_cursor(conn: sqlite3.Connection, table: str, cursor: int) -> None:
@@ -243,6 +326,21 @@ def cmd_baseline() -> int:
 
 def cmd_stage(include_approvals: bool = False, backfill: bool = False) -> int:
     conn = connect()
+    sanitized, invalid_json = sanitize_outbox_payloads(conn)
+    if invalid_json:
+        conn.close()
+        print(
+            json.dumps(
+                {
+                    "staged": 0,
+                    "sanitized": sanitized,
+                    "invalid_outbox_payloads": invalid_json,
+                    "error": "repair invalid local outbox payloads before staging",
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 2
     if not backfill and not has_stage_cursors(conn):
         conn.close()
         print(
@@ -259,35 +357,41 @@ def cmd_stage(include_approvals: bool = False, backfill: bool = False) -> int:
     try:
         signal_floor = 0 if backfill else table_cursor(conn, "voice_signals")
         signal_ceiling = max_rowid(conn, "voice_signals")
-        signal_rows = conn.execute(
-            f"""
-            SELECT id, session_id, source_client, project, timestamp,
-                   signal_type, label, phrase, message
-            FROM voice_signals
-            WHERE rowid > ? AND signal_type IN ({placeholders})
-            ORDER BY id
-            """,
-            [signal_floor, *signal_types],
-        ).fetchall()
+        signal_rows = []
+        if table_exists(conn, "voice_signals"):
+            signal_rows = conn.execute(
+                f"""
+                SELECT id, session_id, source_client, project, timestamp,
+                       signal_type, label, phrase, message
+                FROM voice_signals
+                WHERE rowid > ? AND signal_type IN ({placeholders})
+                ORDER BY id
+                """,
+                [signal_floor, *signal_types],
+            ).fetchall()
         for row in signal_rows:
             staged += int(insert_outbox(conn, stage_signal(row)))
 
-        recipe_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(recipes)").fetchall()
-        }
-        source_expr = "source_client" if "source_client" in recipe_columns else "'claude'"
         recipe_floor = 0 if backfill else table_cursor(conn, "recipes")
         recipe_ceiling = max_rowid(conn, "recipes")
-        recipe_rows = conn.execute(
-            f"""
-            SELECT id, session_id, {source_expr} AS source_client, project_path,
-                   created_at, intent, outcome, prompt_template
-            FROM recipes
-            WHERE rowid > ?
-            ORDER BY created_at
-            """,
-            (recipe_floor,),
-        ).fetchall()
+        recipe_rows = []
+        if table_exists(conn, "recipes"):
+            recipe_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(recipes)").fetchall()
+            }
+            source_expr = (
+                "source_client" if "source_client" in recipe_columns else "'claude'"
+            )
+            recipe_rows = conn.execute(
+                f"""
+                SELECT id, session_id, {source_expr} AS source_client, project_path,
+                       created_at, intent, outcome, prompt_template
+                FROM recipes
+                WHERE rowid > ?
+                ORDER BY created_at
+                """,
+                (recipe_floor,),
+            ).fetchall()
         for row in recipe_rows:
             staged += int(insert_outbox(conn, stage_recipe(row)))
         if not backfill:
@@ -296,7 +400,11 @@ def cmd_stage(include_approvals: bool = False, backfill: bool = False) -> int:
         conn.commit()
     finally:
         conn.close()
-    print(json.dumps({"staged": staged, "database": str(RECALL_DB)}))
+    print(
+        json.dumps(
+            {"staged": staged, "sanitized": sanitized, "database": str(RECALL_DB)}
+        )
+    )
     return 0
 
 
@@ -369,6 +477,21 @@ def cmd_push(url: str | None, token_env: str, limit: int, timeout: float) -> int
         return 2
 
     conn = connect()
+    unsafe, invalid_json = outbox_safety_counts(conn)
+    if unsafe or invalid_json:
+        conn.close()
+        print(
+            json.dumps(
+                {
+                    "sent": 0,
+                    "unsafe_payloads": unsafe,
+                    "invalid_outbox_payloads": invalid_json,
+                    "error": "run context-plane.py sanitize-outbox before push",
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 2
     rows = pending_batch(conn, limit)
     if not rows:
         conn.close()
@@ -501,9 +624,37 @@ def cmd_status() -> int:
     failures = conn.execute(
         "SELECT COUNT(*) FROM cloud_outbox WHERE state = 'pending' AND attempts > 0"
     ).fetchone()[0]
+    unsafe, invalid_json = outbox_safety_counts(conn)
     conn.close()
-    print(json.dumps({"outbox": {row["state"]: row["n"] for row in rows}, "retrying": failures}))
+    print(
+        json.dumps(
+            {
+                "outbox": {row["state"]: row["n"] for row in rows},
+                "retrying": failures,
+                "unsafe_payloads": unsafe,
+                "invalid_outbox_payloads": invalid_json,
+            }
+        )
+    )
     return 0
+
+
+def cmd_sanitize_outbox() -> int:
+    conn = connect()
+    sanitized, invalid_json = sanitize_outbox_payloads(conn)
+    unsafe, remaining_invalid = outbox_safety_counts(conn)
+    conn.close()
+    print(
+        json.dumps(
+            {
+                "sanitized": sanitized,
+                "unsafe_payloads": unsafe,
+                "invalid_outbox_payloads": max(invalid_json, remaining_invalid),
+                "database": str(RECALL_DB),
+            }
+        )
+    )
+    return 2 if unsafe or invalid_json or remaining_invalid else 0
 
 
 def main() -> int:
@@ -540,6 +691,10 @@ def main() -> int:
     verify.add_argument("--timeout", type=float, default=15.0)
 
     sub.add_parser("status", help="show pending and delivered outbox counts")
+    sub.add_parser(
+        "sanitize-outbox",
+        help="remove transcript-derived provenance fields from existing local payloads",
+    )
 
     args = parser.parse_args()
     if args.command == "baseline":
@@ -555,6 +710,8 @@ def main() -> int:
         return cmd_verify(args.url, args.token_env, max(1, min(args.limit, 100)), args.timeout)
     if args.command == "status":
         return cmd_status()
+    if args.command == "sanitize-outbox":
+        return cmd_sanitize_outbox()
     return 2
 
 

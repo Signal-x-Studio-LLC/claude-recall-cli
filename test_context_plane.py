@@ -68,6 +68,8 @@ class ContextPlaneTests(unittest.TestCase):
         serialized = json.dumps(payloads)
         self.assertNotIn("sk-proj-12345678901234567890123456789012", serialized)
         self.assertIn("[redacted-secret]", serialized)
+        self.assertNotIn("evidence_excerpt", serialized)
+        self.assertNotIn("instead of another wrapper", serialized)
 
     def test_baseline_skips_history_and_stages_future_rows(self):
         self.assertEqual(context_plane.cmd_baseline(), 0)
@@ -174,6 +176,61 @@ class ContextPlaneTests(unittest.TestCase):
         count = conn.execute("SELECT COUNT(*) FROM cloud_outbox").fetchone()[0]
         conn.close()
         self.assertEqual(count, 0)
+
+    def test_baseline_and_stage_tolerate_a_missing_recipes_table(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DROP TABLE recipes")
+        conn.commit()
+        conn.close()
+
+        self.assertEqual(context_plane.cmd_baseline(), 0)
+        self.assertEqual(context_plane.cmd_stage(), 0)
+        conn = sqlite3.connect(self.db_path)
+        self.assertEqual(
+            conn.execute(
+                "SELECT value FROM context_plane_meta WHERE key = 'stage_cursor:recipes'"
+            ).fetchone(),
+            ("0",),
+        )
+        conn.close()
+
+    def test_existing_raw_outbox_payload_is_sanitized_before_retry(self):
+        self.assertEqual(context_plane.cmd_stage(backfill=True), 0)
+        conn = sqlite3.connect(self.db_path)
+        event_id, serialized = conn.execute(
+            "SELECT event_id, payload_json FROM cloud_outbox LIMIT 1"
+        ).fetchone()
+        payload = json.loads(serialized)
+        payload["provenance"]["evidence_excerpt"] = "verbatim local prompt text"
+        conn.execute(
+            "UPDATE cloud_outbox SET payload_json = ? WHERE event_id = ?",
+            (json.dumps(payload), event_id),
+        )
+        conn.commit()
+        conn.close()
+
+        deliver = patch.object(context_plane, "deliver")
+        with patch.dict(
+            os.environ,
+            {"TEST_CONTEXT_TOKEN": "secret"},
+        ), deliver as deliver_mock:
+            self.assertEqual(
+                context_plane.cmd_push(
+                    "https://context.example.test", "TEST_CONTEXT_TOKEN", 50, 1
+                ),
+                2,
+            )
+            deliver_mock.assert_not_called()
+
+        self.assertEqual(context_plane.cmd_sanitize_outbox(), 0)
+        conn = sqlite3.connect(self.db_path)
+        cleaned = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM cloud_outbox WHERE event_id = ?", (event_id,)
+            ).fetchone()[0]
+        )
+        conn.close()
+        self.assertNotIn("evidence_excerpt", cleaned["provenance"])
 
 
 if __name__ == "__main__":

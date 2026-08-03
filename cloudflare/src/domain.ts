@@ -39,7 +39,6 @@ export const CandidateEventSchema = z
         session_id: z.string().max(200).nullable().optional(),
         source_timestamp: z.string().max(64).nullable().optional(),
         signal_label: z.string().max(200).nullable().optional(),
-        evidence_excerpt: z.string().max(1200).optional(),
         curation_level: z.enum(["manual_recipe"]).optional(),
       })
       .strict(),

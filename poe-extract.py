@@ -343,13 +343,23 @@ def project_label_for(session_file: Path) -> str:
     cwd = _read_cwd(session_file)
     if cwd:
         return _cwd_to_label(cwd)
+    if transcript_source(session_file) == "gemini":
+        project_dir = session_file.parent.parent
+        project_key = project_dir.name
+        if re.fullmatch(r"[0-9a-f]{64}", project_key, re.IGNORECASE):
+            return f"gemini/{project_key[:12]}"
+        if project_key and project_key != "tmp":
+            return project_key
     # Fallback: best-effort decode of Claude Code's dirname encoding.
-    # Leading '-' marker, then path segments joined by '-'. Strip the
-    # /Users/nino/ home prefix if present and leave the rest as-is (no
-    # lossy dash-to-slash substitution).
+    # Leading '-' marker, then path segments joined by '-'. The user name is
+    # ambiguous once encoded (for example nino-chavez), so anchor on the
+    # Workspace segment instead of hardcoding one machine's home directory.
     name = session_file.parent.name
-    if name.startswith("-Users-nino-"):
-        return name[len("-Users-nino-"):]
+    for marker in ("-Workspace-dev-", "-Workspace-"):
+        if marker in name:
+            return name.split(marker, 1)[1] or "unknown-project"
+    if name.startswith(("-Users-", "-home-")):
+        return "unknown-project"
     return name
 
 
@@ -960,10 +970,7 @@ def cmd_catchup(
     # Stack.md is the human/LLM-facing artifact. Rebuild it when the corpus
     # changed so the consumer never reads stale signals.
     if total_inserted > 0:
-        try:
-            cmd_assemble(_skip_catchup=True)
-        except Exception as e:
-            print(f"stack rebuild failed: {e}", file=sys.stderr)
+        cmd_assemble(_skip_catchup=True)
 
 
 def build_retention_report(
@@ -980,8 +987,7 @@ def build_retention_report(
     """
     if grace_days < 0:
         raise ValueError("grace_days must be zero or greater")
-    if not archive_dir.is_dir():
-        raise FileNotFoundError(f"archive directory not found: {archive_dir}")
+    archive_exists = archive_dir.is_dir()
 
     reference = now or datetime.now(timezone.utc)
     if reference.tzinfo is None:
@@ -996,7 +1002,8 @@ def build_retention_report(
     }
     covered: list[dict] = []
 
-    for transcript in sorted(archive_dir.glob("*.jsonl")):
+    transcripts = sorted(archive_dir.glob("*.jsonl")) if archive_exists else []
+    for transcript in transcripts:
         try:
             stat = transcript.stat()
         except OSError:
@@ -1035,6 +1042,7 @@ def build_retention_report(
     report = {
         "source_client": "codex",
         "archive_dir": str(archive_dir),
+        "archive_exists": archive_exists,
         "grace_days": grace_days,
         "scanned_files": sum(bucket["files"] for bucket in totals.values()),
         **totals,
@@ -2664,6 +2672,7 @@ def cmd_assemble(_skip_catchup: bool = False) -> None:
         lines.append(f"- `{proj}` — {count}")
     lines.append("")
 
+    POE_DIR.mkdir(parents=True, exist_ok=True)
     STACK_PATH.write_text("\n".join(lines))
     print(f"Stack written: {STACK_PATH} ({total} signals)", file=sys.stderr)
 
