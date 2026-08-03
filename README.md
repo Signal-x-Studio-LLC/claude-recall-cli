@@ -6,6 +6,8 @@
 
 Mine reusable lessons from Claude Code, Codex, and Gemini CLI without shipping raw transcripts. Local SQLite and FTS5 remain the default. An optional private Cloudflare context plane lets every harness search the same human-reviewed memory through MCP.
 
+Pull requests run the complete Python suite on Python 3.11 and 3.14, plus the Cloudflare Worker tests and TypeScript check. A secret scan is a separate security signal; it is not test verification.
+
 The repository keeps its original Claude-specific name during the prototype. A rename is gated on real multi-machine use, not the expanded architecture alone.
 
 ## What it does

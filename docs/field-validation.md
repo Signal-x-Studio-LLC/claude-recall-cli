@@ -74,3 +74,4 @@ Do not delete anything during field validation. The retention report always retu
 ## Current field runs
 
 - [Machine A — 2026-08-03](field-runs/2026-08-03-machine-a.md): local baseline and retention receipt; multi-machine gate remains open.
+- [Machine B bootstrap audit — 2026-08-03](field-runs/2026-08-03-machine-b-bootstrap.md): portable-path and CI gaps identified; this is not an ingest receipt.
