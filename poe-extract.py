@@ -274,7 +274,19 @@ _WORKSPACE_PREFIX = str(Path.home() / "Workspace") + "/"
 def _cwd_to_label(cwd: str) -> str:
     """Render a cwd as a short, readable project label.
     /Users/nino/Workspace/dev/wip/aisles-storefront -> wip/aisles-storefront
-    /Users/nino/foo -> foo"""
+    /Users/nino/foo -> foo
+
+    Transcript paths may come from another machine, so do not require the
+    recorded home directory to match Path.home() on the ingest machine.
+    """
+    parts = Path(cwd).parts
+    if "Workspace" in parts:
+        workspace_index = parts.index("Workspace")
+        rel_parts = list(parts[workspace_index + 1:])
+        if rel_parts and rel_parts[0] == "dev":
+            rel_parts = rel_parts[1:]
+        if rel_parts:
+            return "/".join(rel_parts)
     if cwd.startswith(_WORKSPACE_PREFIX):
         rel = cwd[len(_WORKSPACE_PREFIX):]
         # Drop the 'dev/' segment — it's nearly all of them, adds no information.
@@ -283,6 +295,8 @@ def _cwd_to_label(cwd: str) -> str:
         return rel
     if cwd.startswith(_HOME_PREFIX):
         return cwd[len(_HOME_PREFIX):]
+    if len(parts) >= 4 and parts[0] == "/" and parts[1] in {"Users", "home"}:
+        return "/".join(parts[3:])
     return cwd
 
 

@@ -31,4 +31,12 @@ The branch now adds `.github/workflows/ci.yml`, following GitHub's documented `s
 - Cloudflare Worker tests through Vitest
 - the Worker's TypeScript check
 
+The first CI run also found a portability defect that Machine A's local run could
+not expose: project-label normalization compared recorded transcript paths only
+with the ingest machine's current home directory. On a GitHub runner, three
+cross-client tests therefore retained `/Users/nino/...` instead of producing
+portable `tools/...` and `apps/...` labels. The branch now normalizes canonical
+`Workspace` paths independently of the ingest machine's home and includes a
+`/Users/nino.chavez/...` regression case.
+
 This audit does not satisfy any multi-machine ingest requirement. Machine B still needs its own durable outbox, three connected harnesses, real processed candidates, storage baseline, and retention report.

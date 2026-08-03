@@ -21,6 +21,20 @@ def _write_jsonl(path: Path, records: list[dict]) -> Path:
     return path
 
 
+def test_project_labels_are_portable_across_machine_homes():
+    assert (
+        poe._cwd_to_label(
+            "/Users/nino.chavez/Workspace/dev/tools/claude-recall-cli"
+        )
+        == "tools/claude-recall-cli"
+    )
+    assert (
+        poe._cwd_to_label("/home/runner/Workspace/dev/apps/example")
+        == "apps/example"
+    )
+    assert poe._cwd_to_label("/Users/nino.chavez/Documents/notes") == "Documents/notes"
+
+
 def test_codex_uses_event_messages_and_ignores_injected_user_context(tmp_path):
     session_id = "019fc4a9-f447-70e2-9ab6-746e66cfe97f"
     transcript = _write_jsonl(
