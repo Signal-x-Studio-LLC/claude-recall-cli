@@ -44,7 +44,24 @@ another field push:
 - Queue/D1 effect: none; validation rejected the event before enqueue
 
 The deployed Worker now rejects stale clients that send transcript-derived
-provenance. Existing D1 data is unchanged: 17 `voice_signals` rows still contain
-the old excerpt field. Migration `0002_remove_raw_provenance.sql` is prepared
-and locally tested, but applying that destructive redaction remotely requires
-separate approval and a recovery receipt.
+provenance.
+
+## Existing-data privacy remediation — 2026-08-03
+
+After explicit operator approval, migration
+`0002_remove_raw_provenance.sql` was applied remotely with repository-pinned
+Wrangler `4.114.0`.
+
+- Pre-migration Time Travel bookmark:
+  `00000009-00000000-000050bc-e4c359e6461ea634c09bae36e555f41b`
+- Migration scope: remove only `provenance.evidence_excerpt` and write a
+  non-content `provenance_redacted` event for each affected memory
+- Post-migration D1 aggregate: 18 memories, zero excerpt fields, 17 redaction
+  events
+- Verification query effect: zero rows written
+- R2 reconciliation: 76-byte Approved snapshot, zero memories, zero excerpt
+  fields, SHA-256
+  `ed230cc686255067114638d382955196d4e8368ee8a10c382c7a1d70c46b3090`
+
+No memory body, transcript text, or excerpt text was emitted during the
+verification. The temporary R2 download was removed afterward.
