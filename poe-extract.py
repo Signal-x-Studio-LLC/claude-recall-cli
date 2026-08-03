@@ -34,6 +34,7 @@ from pathlib import Path
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 CODEX_ARCHIVED_SESSIONS_DIR = Path.home() / ".codex" / "archived_sessions"
+GEMINI_SESSIONS_DIR = Path.home() / ".gemini" / "tmp"
 POE_DIR = Path.home() / ".claude" / "poe"
 CORPUS_PATH = POE_DIR / "corpus.jsonl"
 STACK_PATH = POE_DIR / "stack.md"
@@ -286,8 +287,19 @@ def _cwd_to_label(cwd: str) -> str:
 
 
 def _read_cwd(session_file: Path) -> str | None:
-    """Peek the JSONL for the first entry that has a cwd field. Cheap — usually
-    in the first or second line. Returns None if not found."""
+    """Read the transcript's project root without scanning tool payloads."""
+    if transcript_source(session_file) == "gemini":
+        try:
+            data = json.loads(session_file.read_text(errors="replace"))
+            directories = data.get("directories")
+            if isinstance(directories, list) and directories:
+                return str(directories[0])
+            marker = session_file.parent.parent / ".project_root"
+            if marker.exists():
+                return marker.read_text(errors="replace").strip() or None
+        except (OSError, json.JSONDecodeError):
+            return None
+        return None
     try:
         with open(session_file, "r", errors="replace") as f:
             for i, line in enumerate(f):
@@ -332,8 +344,17 @@ def transcript_source(session_file: Path) -> str:
     path = str(session_file)
     if "/.codex/" in path:
         return "codex"
+    if "/.gemini/" in path:
+        return "gemini"
     if "/.claude/" in path:
         return "claude"
+    if session_file.suffix == ".json":
+        try:
+            data = json.loads(session_file.read_text(errors="replace"))
+            if isinstance(data, dict) and isinstance(data.get("messages"), list):
+                return "gemini"
+        except (OSError, json.JSONDecodeError):
+            pass
     try:
         with open(session_file, "r", errors="replace") as stream:
             for index, line in enumerate(stream):
@@ -356,7 +377,15 @@ def transcript_source(session_file: Path) -> str:
 
 def session_id_for(session_file: Path) -> str:
     """Return the product session id, not Codex's rollout filename stem."""
-    if transcript_source(session_file) == "codex":
+    source = transcript_source(session_file)
+    if source == "gemini":
+        try:
+            data = json.loads(session_file.read_text(errors="replace"))
+            if data.get("sessionId"):
+                return str(data["sessionId"])
+        except (OSError, json.JSONDecodeError):
+            pass
+    if source == "codex":
         try:
             with open(session_file, "r", errors="replace") as stream:
                 for index, line in enumerate(stream):
@@ -409,6 +438,26 @@ def _claude_message_text(obj: dict) -> str | None:
 def iter_transcript_messages(session_file: Path):
     """Yield normalized `(timestamp, role, phase, text)` message events."""
     source = transcript_source(session_file)
+    if source == "gemini":
+        try:
+            data = json.loads(session_file.read_text(errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            return
+        for message in data.get("messages", []):
+            if not isinstance(message, dict):
+                continue
+            event_type = message.get("type")
+            role = (
+                "user"
+                if event_type == "user"
+                else "assistant"
+                if event_type == "gemini"
+                else None
+            )
+            text = message.get("content")
+            if role and isinstance(text, str) and text.strip():
+                yield message.get("timestamp", ""), role, None, text
+        return
     try:
         with open(session_file, "r", errors="replace") as stream:
             for line in stream:
@@ -842,7 +891,9 @@ def _ingest_file(conn: sqlite3.Connection, jf: Path) -> tuple[int, int]:
     return (len(records) + len(validated), inserted + v_inserted)
 
 
-def _iter_session_files(include_codex: bool = False) -> list[Path]:
+def _iter_session_files(
+    include_codex: bool = False, include_gemini: bool = False
+) -> list[Path]:
     files: list[Path] = []
     if PROJECTS_DIR.exists():
         for proj_dir in sorted(PROJECTS_DIR.iterdir()):
@@ -853,17 +904,25 @@ def _iter_session_files(include_codex: bool = False) -> list[Path]:
             files.extend(CODEX_SESSIONS_DIR.rglob("*.jsonl"))
         if CODEX_ARCHIVED_SESSIONS_DIR.exists():
             files.extend(CODEX_ARCHIVED_SESSIONS_DIR.glob("*.jsonl"))
+    if include_gemini and GEMINI_SESSIONS_DIR.exists():
+        files.extend(GEMINI_SESSIONS_DIR.glob("*/chats/session-*.json"))
     return sorted(set(files))
 
 
-def cmd_catchup(verbose: bool = False, include_codex: bool = False) -> None:
+def cmd_catchup(
+    verbose: bool = False,
+    include_codex: bool = False,
+    include_gemini: bool = False,
+) -> None:
     """Ingest every session file with mtime newer than its watermark.
 
     Idempotent: re-running with no new data is near-zero cost (one stat
     per file, no extraction, no DB writes beyond the meta timestamp).
     Safe to invoke from any trigger — hook drain, schedule, read path."""
     conn = db_connect()
-    files = _iter_session_files(include_codex=include_codex)
+    files = _iter_session_files(
+        include_codex=include_codex, include_gemini=include_gemini
+    )
     scanned = 0
     ingested_files = 0
     total_signals = 0
@@ -913,7 +972,9 @@ def _resolve_queued_transcript(entry: dict) -> Path | None:
 
 
 def cmd_drain_queue(
-    verbose: bool = False, include_codex: bool = False
+    verbose: bool = False,
+    include_codex: bool = False,
+    include_gemini: bool = False,
 ) -> None:
     """Drain ~/.claude/poe/queue, ingesting each listed transcript path.
 
@@ -927,14 +988,22 @@ def cmd_drain_queue(
         # Nothing queued, but still run a watermark sweep so the worker
         # is self-healing if WatchPaths missed an event.
         conn.close()
-        cmd_catchup(verbose=verbose, include_codex=include_codex)
+        cmd_catchup(
+            verbose=verbose,
+            include_codex=include_codex,
+            include_gemini=include_gemini,
+        )
         return
     tmp = QUEUE_PATH.with_suffix(".draining")
     try:
         QUEUE_PATH.rename(tmp)
     except FileNotFoundError:
         conn.close()
-        cmd_catchup(verbose=verbose, include_codex=include_codex)
+        cmd_catchup(
+            verbose=verbose,
+            include_codex=include_codex,
+            include_gemini=include_gemini,
+        )
         return
 
     paths: list[Path] = []
@@ -978,7 +1047,11 @@ def cmd_drain_queue(
             file=sys.stderr,
         )
     # Belt-and-suspenders: catch any sessions the queue missed.
-    cmd_catchup(verbose=False, include_codex=include_codex)
+    cmd_catchup(
+        verbose=False,
+        include_codex=include_codex,
+        include_gemini=include_gemini,
+    )
 
 
 HEDGE_WORDS = {
@@ -2004,7 +2077,12 @@ def cmd_enqueue() -> None:
         return
     source_client = payload.get("source_client")
     if not source_client:
-        source_client = "codex" if "/.codex/" in str(path) else "claude"
+        if "/.codex/" in str(path):
+            source_client = "codex"
+        elif "/.gemini/" in str(path):
+            source_client = "gemini"
+        else:
+            source_client = "claude"
     entry = {
         "source_client": source_client,
         "session_id": payload.get("session_id") or "",
@@ -2498,12 +2576,20 @@ def main() -> None:
         "--include-codex", action="store_true",
         help="also sweep active and archived Codex transcripts",
     )
+    c.add_argument(
+        "--include-gemini", action="store_true",
+        help="also sweep retained Gemini CLI transcripts",
+    )
 
     d = sub.add_parser("drain-queue", help="drain ~/.claude/poe/queue then catchup-sweep")
     d.add_argument("--verbose", action="store_true", help="log even when nothing changed")
     d.add_argument(
         "--include-codex", action="store_true",
         help="include Codex transcripts in the fallback catchup sweep",
+    )
+    d.add_argument(
+        "--include-gemini", action="store_true",
+        help="include Gemini transcripts in the fallback catchup sweep",
     )
 
     sub.add_parser("enqueue", help="hook command: read stdin JSON, append transcript_path to queue")
@@ -2542,10 +2628,16 @@ def main() -> None:
     elif args.cmd == "assemble":
         cmd_assemble()
     elif args.cmd == "catchup":
-        cmd_catchup(verbose=args.verbose, include_codex=args.include_codex)
+        cmd_catchup(
+            verbose=args.verbose,
+            include_codex=args.include_codex,
+            include_gemini=args.include_gemini,
+        )
     elif args.cmd == "drain-queue":
         cmd_drain_queue(
-            verbose=args.verbose, include_codex=args.include_codex
+            verbose=args.verbose,
+            include_codex=args.include_codex,
+            include_gemini=args.include_gemini,
         )
     elif args.cmd == "enqueue":
         cmd_enqueue()

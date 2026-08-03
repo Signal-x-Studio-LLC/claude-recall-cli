@@ -1,4 +1,4 @@
-"""Regression tests for Claude and Codex transcript normalization."""
+"""Regression tests for Claude, Codex, and Gemini transcript normalization."""
 
 from __future__ import annotations
 
@@ -142,6 +142,58 @@ def test_claude_transcript_behavior_is_preserved(tmp_path):
     signals = poe._extract_from_file(transcript)
     assert len(signals) == 1
     assert signals[0]["source_client"] == "claude"
+
+
+def test_gemini_json_transcript_is_normalized(tmp_path):
+    session_id = "a3b47b2c-7dde-41bf-b101-8c67262cad62"
+    project_dir = tmp_path / "project-hash"
+    chats_dir = project_dir / "chats"
+    chats_dir.mkdir(parents=True)
+    (project_dir / ".project_root").write_text(
+        "/Users/nino/Workspace/dev/apps/gemini-example\n"
+    )
+    transcript = chats_dir / "session-2026-08-02T20-00-a3b47b2c.json"
+    transcript.write_text(
+        json.dumps(
+            {
+                "sessionId": session_id,
+                "projectHash": "project-hash",
+                "messages": [
+                    {
+                        "id": "u1",
+                        "timestamp": "2026-08-02T20:00:00Z",
+                        "type": "user",
+                        "content": "I prefer one shared instruction source across every harness.",
+                    },
+                    {
+                        "id": "g1",
+                        "timestamp": "2026-08-02T20:00:01Z",
+                        "type": "gemini",
+                        "content": (
+                            "The shared source is wired through a thin Gemini adapter and "
+                            "the transcript remains local until redacted records are staged."
+                        ),
+                    },
+                    {
+                        "id": "u2",
+                        "timestamp": "2026-08-02T20:00:02Z",
+                        "type": "user",
+                        "content": "go",
+                    },
+                ],
+            }
+        )
+    )
+
+    assert poe.transcript_source(transcript) == "gemini"
+    assert poe.session_id_for(transcript) == session_id
+    assert poe.project_label_for(transcript) == "apps/gemini-example"
+    pairs = list(poe.iter_pairs(transcript))
+    assert len(pairs) == 1
+    assert "shared source is wired" in pairs[0][0]
+    signals = poe._extract_from_file(transcript)
+    assert signals
+    assert {record["source_client"] for record in signals} == {"gemini"}
 
 
 def test_codex_queue_entry_resolves_after_archive_move(tmp_path):

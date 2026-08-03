@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+cloudflare/node_modules/
+cloudflare/.wrangler/
+cloudflare/.dev.vars
+

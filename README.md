@@ -4,7 +4,20 @@
 
 # claude-recall-cli
 
-Save and search reusable Claude Code session entries. Global slash commands backed by SQLite + FTS5.
+Mine reusable lessons from Claude Code, Codex, and Gemini CLI without shipping raw transcripts. Local SQLite and FTS5 remain the default. An optional private Cloudflare context plane lets every harness search the same human-reviewed memory through MCP.
+
+The repository keeps its original Claude-specific name during the prototype. A rename is gated on real multi-machine use, not the expanded architecture alone.
+
+## What it does
+
+- Captures retained transcripts from Claude Code, Codex, and Gemini CLI through cheap `SessionEnd` hooks.
+- Extracts credential-redacted voice signals and reusable recipes into local `recall.db`.
+- Searches local memory without any cloud dependency.
+- Optionally sends only staged, redacted candidates through a durable local outbox to Cloudflare.
+- Exposes Approved memory to all three harnesses through one authenticated MCP server.
+- Keeps Git instructions and owning project documents authoritative.
+
+Start with local recall. Add the cloud layer only when multiple machines need one reviewed index.
 
 ## Install
 
@@ -76,11 +89,11 @@ miner, extend this one instead.
 | `python3 poe-extract.py assemble` | Build `~/.claude/poe/stack.md` from the DB |
 | `python3 poe-extract.py query <terms>` | FTS5 search the corpus, emit a markdown block to paste as context |
 | `python3 poe-extract.py run` | extract + publish + assemble (full refresh) |
-| `python3 poe-extract.py catchup --include-codex` | Idempotently ingest Claude plus active/archived Codex transcripts |
+| `python3 poe-extract.py catchup --include-codex --include-gemini` | Idempotently ingest Claude, active/archived Codex, and retained Gemini transcripts |
 
 ### Continuous generation (SessionEnd hook)
 
-Claude Code and Codex can share the same fast queue and launchd worker. The hook only records transcript identity; database work happens out of band.
+Claude Code, Codex, and Gemini CLI can share the same fast queue and scheduled worker. The hook only records transcript identity; database work happens out of band.
 
 Claude Code uses:
 
@@ -103,7 +116,29 @@ Claude Code uses:
 }
 ```
 
-Codex uses the same command under `SessionEnd` with a three-second timeout. Its queue record includes `session_id`, so the worker can find a transcript after Codex moves it into `archived_sessions`. Add `--include-codex` to the launchd worker's `drain-queue` arguments for hourly catch-up of missed events.
+Codex uses the same command under `SessionEnd` with a three-second timeout. Its queue record includes `session_id`, so the worker can find a transcript after Codex moves it into `archived_sessions`. Gemini supplies the retained JSON transcript path in the same hook input. Add `--include-codex --include-gemini` to the worker's `drain-queue` arguments for catch-up of missed events.
+
+## Optional shared context plane
+
+The Cloudflare layer is a private reviewed index, not a transcript warehouse and not a replacement for shared instructions.
+
+```bash
+python3 context-plane.py stage
+with-secret 'Cloudflare recall-context-plane' \
+  --as RECALL_CONTEXT_TOKEN -- \
+  python3 context-plane.py push
+python3 context-plane.py status
+```
+
+New records always arrive as `Candidate`. Only a human-authorized MCP call can mark one `Approved`. Normal searches default to Approved memory and omit Candidate, Contradicted, Superseded, and Stale records.
+
+Read these in order:
+
+1. [Architecture](docs/architecture.md) — data flow, state model, and failure behavior.
+2. [Cloudflare deployment](docs/deploy-cloudflare.md) — D1, Queues, R2, AI Gateway, secrets, and recovery.
+3. [Client connections](docs/connect-clients.md) — Claude Code, Codex, and Gemini hooks plus MCP adapters.
+4. [Deployment receipt](docs/deployment-receipt.md) — what the live private prototype has actually proved.
+5. [Field-validation gate](docs/field-validation.md) — evidence required before a rename or reflective blog post.
 
 Deduplication is automatic. Delete a raw transcript only after its current path and modification time are covered by `ingest_watermark`, and after any durable lesson has been promoted into a recipe or canonical project documentation.
 

@@ -1837,7 +1837,7 @@ def main():
     save_p = sub.add_parser("save")
     save_p.add_argument("--session-id", required=True)
     save_p.add_argument(
-        "--source-client", choices=["claude", "codex"], default="claude"
+        "--source-client", choices=["claude", "codex", "gemini"], default="claude"
     )
     save_p.add_argument("--project", default=None)
     save_p.add_argument("--intent", required=True)
