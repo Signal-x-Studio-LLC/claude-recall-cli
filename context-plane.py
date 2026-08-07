@@ -25,6 +25,12 @@ from pathlib import Path
 
 
 RECALL_DB = Path(os.environ.get("RECALL_DB", Path.home() / ".claude" / "recall.db"))
+HEARTBEAT_PATH = Path(
+    os.environ.get(
+        "RECALL_CONTEXT_HEARTBEAT",
+        Path.home() / ".claude" / "recall-context-heartbeat.json",
+    )
+)
 DEFAULT_TOKEN_ENV = "RECALL_CONTEXT_TOKEN"
 DEFAULT_URL_ENV = "RECALL_CONTEXT_URL"
 SECRET_PATTERNS = re.compile(
@@ -627,6 +633,109 @@ def cmd_verify(url: str | None, token_env: str, limit: int, timeout: float) -> i
     return 0
 
 
+def count_cloud_candidates(url: str, token: str, timeout: float) -> int:
+    """Ask the Worker how many memories are waiting for human review.
+
+    The MCP endpoint frames its JSON-RPC reply as a server-sent event, so the
+    payload arrives behind a `data: ` prefix even in json response mode.
+    """
+    request = urllib.request.Request(
+        f"{url}/mcp",
+        data=json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_memory_candidates",
+                    "arguments": {"limit": 50},
+                },
+            }
+        ).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "User-Agent": "claude-recall-context-plane/0.1",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read().decode("utf-8")
+    envelope = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("data:"):
+            envelope = json.loads(line[5:].strip())
+            break
+    if envelope is None:
+        envelope = json.loads(raw)
+    blocks = envelope.get("result", {}).get("content", [])
+    for block in blocks:
+        if block.get("type") == "text":
+            return len(json.loads(block["text"]).get("memories", []))
+    raise RuntimeError("candidate listing returned no text content")
+
+
+def cmd_heartbeat(
+    url: str | None, token_env: str, timeout: float, failed_step: str | None
+) -> int:
+    """Write the review/liveness heartbeat the SessionStart nudge reads.
+
+    A jammed pipeline emits no error, so a bare candidate count is not enough:
+    a stalled sync and an empty queue both read as zero. `last_success` is
+    carried forward across failures precisely so the nudge can tell them apart.
+    """
+    previous: dict = {}
+    if HEARTBEAT_PATH.exists():
+        try:
+            previous = json.loads(HEARTBEAT_PATH.read_text())
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    heartbeat = {
+        "checked_at": now,
+        "last_success": previous.get("last_success"),
+        "candidates": previous.get("candidates"),
+        "ok": False,
+        "error": None,
+    }
+
+    if failed_step:
+        heartbeat["error"] = f"sync failed at step: {failed_step}"
+    else:
+        try:
+            base_url, token = resolve_push_settings(url, token_env)
+            heartbeat["candidates"] = count_cloud_candidates(base_url, token, timeout)
+            heartbeat["last_success"] = now
+            heartbeat["ok"] = True
+        except (
+            ValueError,
+            RuntimeError,
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            json.JSONDecodeError,
+            TimeoutError,
+            OSError,
+        ) as error:
+            heartbeat["error"] = f"{type(error).__name__}: {error}"
+
+    conn = connect()
+    heartbeat["outbox"] = {
+        row["state"]: row["n"]
+        for row in conn.execute(
+            "SELECT state, COUNT(*) AS n FROM cloud_outbox GROUP BY state"
+        )
+    }
+    conn.close()
+
+    HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    HEARTBEAT_PATH.write_text(json.dumps(heartbeat, indent=2) + "\n")
+    print(json.dumps(heartbeat))
+    return 0 if heartbeat["ok"] else 1
+
+
 def cmd_status() -> int:
     conn = connect()
     rows = conn.execute(
@@ -725,6 +834,19 @@ def main() -> int:
     verify.add_argument("--timeout", type=float, default=15.0)
 
     sub.add_parser("status", help="show pending and delivered outbox counts")
+
+    heartbeat = sub.add_parser(
+        "heartbeat", help="write the review-queue and liveness heartbeat file"
+    )
+    heartbeat.add_argument("--url", help=f"Worker base URL (default: ${DEFAULT_URL_ENV})")
+    heartbeat.add_argument("--token-env", default=DEFAULT_TOKEN_ENV)
+    heartbeat.add_argument("--timeout", type=float, default=15.0)
+    heartbeat.add_argument(
+        "--failed-step",
+        default=None,
+        help="record that the sync died at this step instead of querying the cloud",
+    )
+
     sub.add_parser(
         "sanitize-outbox",
         help="remove transcript-derived provenance fields from existing local payloads",
@@ -745,6 +867,10 @@ def main() -> int:
         return cmd_verify(args.url, args.token_env, max(1, min(args.limit, 100)), args.timeout)
     if args.command == "status":
         return cmd_status()
+    if args.command == "heartbeat":
+        return cmd_heartbeat(
+            args.url, args.token_env, args.timeout, args.failed_step
+        )
     if args.command == "sanitize-outbox":
         return cmd_sanitize_outbox()
     if args.command == "quarantine-local-only":

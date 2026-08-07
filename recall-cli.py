@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import uuid
 from collections import Counter
@@ -215,12 +216,61 @@ def _migrate(db: sqlite3.Connection):
                 )
         db.execute("UPDATE schema_version SET version = 6")
         db.commit()
+        version = 6
+
+    if version < 7:
+        # Nothing has ever recorded whether a saved recipe gets reused. Without
+        # it there is no way to tell a corpus that is too small to retrieve from
+        # apart from retrieval that does not work.
+        columns = {
+            row[1] for row in db.execute("PRAGMA table_info(recipes)").fetchall()
+        }
+        if "use_count" not in columns:
+            db.execute(
+                "ALTER TABLE recipes ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_used_at" not in columns:
+            db.execute("ALTER TABLE recipes ADD COLUMN last_used_at TEXT")
+        db.execute("UPDATE schema_version SET version = 7")
+        db.commit()
+
+
+def _canonical_project_path(project: str | None) -> str | None:
+    """Resolve a linked-worktree path to the main checkout it belongs to.
+
+    Worktrees are mandatory for parallel sessions and the reaper deletes them,
+    so a recipe stamped with a worktree path outlives the directory it names and
+    stops matching project-scoped search. Resolve while the worktree still
+    exists; a main checkout resolves to itself, so this is idempotent.
+    """
+    if not project:
+        return project
+    try:
+        common = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(Path(project).expanduser()),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return project
+    resolved = Path(common)
+    return str(resolved.parent) if resolved.name == ".git" else project
 
 
 def cmd_save(args):
     """Save an entry to the database with auto-populated analysis metrics."""
     db = get_db()
     recipe_id = str(uuid.uuid4())[:8]
+    args.project = _canonical_project_path(args.project)
 
     # Calculate token count and cost from session if available
     token_count = None
@@ -417,6 +467,12 @@ def cmd_use(args):
         sys.exit(1)
 
     recipe = dict(row)
+
+    db.execute(
+        "UPDATE recipes SET use_count = use_count + 1, last_used_at = ? WHERE id = ?",
+        (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), recipe["id"]),
+    )
+    db.commit()
 
     # Parse template for variables, unescape literal \n
     template = (recipe.get("prompt_template") or "").replace("\\n", "\n")

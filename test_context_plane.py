@@ -287,5 +287,133 @@ class ContextPlaneTests(unittest.TestCase):
         self.assertNotIn("Verbatim", " ".join(str(value) for value in receipt))
 
 
+class CandidateCountTests(unittest.TestCase):
+    """The MCP endpoint frames its reply as SSE even in json response mode."""
+
+    @staticmethod
+    def _response(body: str):
+        class Fake:
+            def read(self):
+                return body.encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        return Fake()
+
+    @staticmethod
+    def _envelope(count: int) -> str:
+        inner = json.dumps({"memories": [{"id": f"mem_{n}"} for n in range(count)]})
+        return json.dumps({"result": {"content": [{"type": "text", "text": inner}]}})
+
+    def _count(self, body: str) -> int:
+        with patch.object(
+            context_plane.urllib.request, "urlopen", return_value=self._response(body)
+        ):
+            return context_plane.count_cloud_candidates("https://example", "token", 5)
+
+    def test_parses_server_sent_event_frame(self):
+        body = "event: message\ndata: " + self._envelope(2) + "\n\n"
+        self.assertEqual(self._count(body), 2)
+
+    def test_parses_bare_json_body(self):
+        self.assertEqual(self._count(self._envelope(3)), 3)
+
+    def test_empty_queue_counts_zero(self):
+        self.assertEqual(self._count("data: " + self._envelope(0)), 0)
+
+    def test_missing_text_content_is_an_error(self):
+        body = json.dumps({"result": {"content": []}})
+        with self.assertRaises(RuntimeError):
+            self._count(body)
+
+
+class HeartbeatTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp.name) / "recall.db"
+        self.heartbeat_path = Path(self.temp.name) / "heartbeat.json"
+        context_plane.RECALL_DB = self.db_path
+        context_plane.HEARTBEAT_PATH = self.heartbeat_path
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(
+            """
+            CREATE TABLE cloud_outbox (
+              event_id TEXT PRIMARY KEY, source_table TEXT, source_row_id TEXT,
+              payload_json TEXT, state TEXT, attempts INTEGER DEFAULT 0,
+              last_error TEXT, created_at TEXT, sent_at TEXT
+            );
+            INSERT INTO cloud_outbox
+              (event_id, source_table, source_row_id, payload_json, state)
+            VALUES ('evt_1', 'recipes', 'r1', '{}', 'acknowledged');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _read(self) -> dict:
+        return json.loads(self.heartbeat_path.read_text())
+
+    def test_success_records_count_and_timestamp(self):
+        env = {
+            "RECALL_CONTEXT_URL": "https://example",
+            "RECALL_CONTEXT_TOKEN": "token",
+        }
+        with patch.dict(os.environ, env), patch.object(
+            context_plane, "count_cloud_candidates", return_value=4
+        ):
+            self.assertEqual(
+                context_plane.cmd_heartbeat(None, "RECALL_CONTEXT_TOKEN", 5, None), 0
+            )
+        written = self._read()
+        self.assertTrue(written["ok"])
+        self.assertEqual(written["candidates"], 4)
+        self.assertEqual(written["last_success"], written["checked_at"])
+        self.assertEqual(written["outbox"], {"acknowledged": 1})
+
+    def test_failure_carries_last_success_forward(self):
+        """The whole nudge design rests on this.
+
+        Without carry-forward a stalled sync reports the same zero a clear
+        queue does, which is the silent failure the heartbeat exists to expose.
+        """
+        env = {
+            "RECALL_CONTEXT_URL": "https://example",
+            "RECALL_CONTEXT_TOKEN": "token",
+        }
+        with patch.dict(os.environ, env), patch.object(
+            context_plane, "count_cloud_candidates", return_value=4
+        ):
+            context_plane.cmd_heartbeat(None, "RECALL_CONTEXT_TOKEN", 5, None)
+        first = self._read()
+
+        self.assertEqual(
+            context_plane.cmd_heartbeat(None, "RECALL_CONTEXT_TOKEN", 5, "stage"), 1
+        )
+        after = self._read()
+        self.assertFalse(after["ok"])
+        self.assertIn("stage", after["error"])
+        self.assertEqual(after["last_success"], first["last_success"])
+        self.assertEqual(after["candidates"], 4)
+
+    def test_missing_token_is_recorded_not_raised(self):
+        with patch.dict(
+            os.environ, {"RECALL_CONTEXT_URL": "https://example"}, clear=True
+        ):
+            self.assertEqual(
+                context_plane.cmd_heartbeat(None, "RECALL_CONTEXT_TOKEN", 5, None), 1
+            )
+        written = self._read()
+        self.assertFalse(written["ok"])
+        self.assertIsNone(written["last_success"])
+        self.assertIn("RECALL_CONTEXT_TOKEN", written["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
