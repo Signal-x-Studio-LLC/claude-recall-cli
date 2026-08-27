@@ -84,6 +84,10 @@ NOISE_PREFIXES = (
     "SessionStart hook feedback:",
     # Slash-command / subagent prompt templates that arrive on the user turn.
     "Review a single git commit",
+    # Codex wraps a delegated thread's handoff in this envelope and delivers it
+    # on the user turn. It carries the parent agent's summary, not Nino's — 10
+    # of its 11 rows scored as corrections.
+    "<codex_delegation>",
 )
 
 # Messages dominated by pasted logs/code/tool output are not user voice.
