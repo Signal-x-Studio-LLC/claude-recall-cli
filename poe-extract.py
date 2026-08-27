@@ -70,6 +70,18 @@ NOISE_PREFIXES = (
     "<teammate-message",
     "<agent-message",
     "Another Claude session sent a message",
+    # Our OWN hooks' feedback. Claude Code injects a Stop hook's `reason` as a
+    # user turn, so anti-hesitation.py's prose was being ingested as Nino
+    # correcting the agent — 272 rows, 32% of the correction/rejection corpus
+    # as of 2026-08-26, and the single most common "correction" in it. A corpus
+    # that feeds the prompt-hook was training the agent on its own voice.
+    "Stop hook feedback:",
+    "PreToolUse hook feedback:",
+    "PostToolUse hook feedback:",
+    "UserPromptSubmit hook feedback:",
+    "SessionStart hook feedback:",
+    # Slash-command / subagent prompt templates that arrive on the user turn.
+    "Review a single git commit",
 )
 
 # Messages dominated by pasted logs/code/tool output are not user voice.
