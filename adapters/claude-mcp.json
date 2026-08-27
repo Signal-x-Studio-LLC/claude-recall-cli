@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "recall-context": {
+      "type": "http",
+      "url": "${RECALL_CONTEXT_URL}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${RECALL_CONTEXT_TOKEN}"
+      }
+    }
+  }
+}
+

@@ -4,7 +4,23 @@
 
 # claude-recall-cli
 
-Save and search reusable Claude Code session entries. Global slash commands backed by SQLite + FTS5.
+Mine reusable lessons from Claude Code, Codex, and Gemini CLI without shipping raw transcripts. Local SQLite and FTS5 remain the default. An optional private Cloudflare context plane lets every harness search the same human-reviewed memory through MCP.
+
+Pull requests run the complete Python suite on Python 3.11 and 3.14, plus the Cloudflare Worker tests and TypeScript check. A secret scan is a separate security signal; it is not test verification.
+
+The repository keeps its original Claude-specific name during the prototype. A rename is gated on real multi-machine use, not the expanded architecture alone.
+
+## What it does
+
+- Captures retained transcripts from Claude Code, Codex, and Gemini CLI through cheap `SessionEnd` hooks.
+- Extracts credential-redacted voice signals and reusable recipes into local `recall.db`.
+- Searches local memory without any cloud dependency.
+- Optionally sends only manually promoted recipes through a durable local outbox to Cloudflare.
+- Keeps raw messages, mined voice signals, and evidence excerpts local; cloud provenance contains source identifiers only.
+- Exposes Approved memory to all three harnesses through one authenticated MCP server.
+- Keeps Git instructions and owning project documents authoritative.
+
+Start with local recall. Add the cloud layer only when multiple machines need one reviewed index.
 
 ## Install
 
@@ -65,7 +81,7 @@ miner, extend this one instead.
 
 ## Poe — voice corpus
 
-`poe-extract.py` mines user turns across all sessions to build a queryable corpus of how you actually think, correct, and push back. Signals (corrections, preferences, rationale, rejections, declarations, approvals) are stored in the same `recall.db` under `voice_signals` + FTS5.
+`poe-extract.py` mines human turns from Claude Code and Codex sessions to build a queryable corpus of how you actually think, correct, and push back. Signals (corrections, preferences, rationale, rejections, declarations, approvals) are stored in the same `recall.db` under `voice_signals` + FTS5 with `source_client` provenance.
 
 | Command | Description |
 |---------|-------------|
@@ -76,10 +92,14 @@ miner, extend this one instead.
 | `python3 poe-extract.py assemble` | Build `~/.claude/poe/stack.md` from the DB |
 | `python3 poe-extract.py query <terms>` | FTS5 search the corpus, emit a markdown block to paste as context |
 | `python3 poe-extract.py run` | extract + publish + assemble (full refresh) |
+| `python3 poe-extract.py catchup --include-codex --include-gemini` | Idempotently ingest Claude, active/archived Codex, and retained Gemini transcripts |
+| `python3 poe-extract.py retention-report` | Dry-run watermark coverage for archived Codex transcripts; never deletes or declares archive safety |
 
 ### Continuous generation (SessionEnd hook)
 
-Add to `~/.claude/settings.json` so every session automatically contributes new signals to Poe:
+Claude Code, Codex, and Gemini CLI can share the same fast queue and scheduled worker. The hook only records transcript identity; database work happens out of band.
+
+Claude Code uses:
 
 ```json
 {
@@ -90,8 +110,8 @@ Add to `~/.claude/settings.json` so every session automatically contributes new 
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.claude/recall-cli/poe-extract.py extract --session \"$CLAUDE_SESSION_FILE\" >> ~/.claude/poe-extract.log 2>&1",
-            "timeout": 30
+            "command": "python3 ~/Workspace/dev/tools/claude-recall-cli/poe-extract.py enqueue",
+            "timeout": 5
           }
         ]
       }
@@ -100,7 +120,58 @@ Add to `~/.claude/settings.json` so every session automatically contributes new 
 }
 ```
 
-Deduplication is automatic — re-running on the same session is idempotent.
+Codex uses the same command under `SessionEnd` with a three-second timeout. Its queue record includes `session_id`, so the worker can find a transcript after Codex moves it into `archived_sessions`. Gemini supplies the retained JSON transcript path in the same hook input. Add `--include-codex --include-gemini` to the worker's `drain-queue` arguments for catch-up of missed events.
+
+## Optional shared context plane
+
+The Cloudflare layer is a private reviewed index, not a transcript warehouse and not a replacement for shared instructions.
+
+Automatic voice-signal mining is local evidence, not cloud memory. Promote a
+durable lesson with `/recall save` or the session-closeout workflow before
+staging it. Existing prototype outboxes should quarantine their old automatic
+signal payloads once; the command retains metadata-only hash receipts locally.
+
+```bash
+python3 poe-extract.py drain-queue --include-codex --include-gemini
+python3 context-plane.py quarantine-local-only  # once for prototype outboxes
+python3 context-plane.py baseline  # once: do not upload existing history
+python3 context-plane.py stage
+with-secret 'Cloudflare recall-context-plane' \
+  --as RECALL_CONTEXT_TOKEN -- \
+  python3 context-plane.py push
+python3 context-plane.py status
+```
+
+Promoted recipes still arrive as `Candidate`: local curation makes content
+eligible to sync, while cloud review decides whether it may guide work. Only a
+human-authorized MCP call can mark one `Approved`. Normal searches default to
+Approved memory and omit Candidate, Contradicted, Superseded, and Stale records.
+
+`baseline` makes scheduled sync future-facing. Use `stage --backfill` only when you deliberately want to review historical local records in the cloud.
+
+Read these in order:
+
+1. [Architecture](docs/architecture.md) — data flow, state model, and failure behavior.
+2. [Cloudflare deployment](docs/deploy-cloudflare.md) — D1, Queues, R2, AI Gateway, secrets, and recovery.
+3. [Client connections](docs/connect-clients.md) — Claude Code, Codex, and Gemini hooks plus MCP adapters.
+4. [Deployment receipt](docs/deployment-receipt.md) — what the live private prototype has actually proved.
+5. [Field-validation gate](docs/field-validation.md) — evidence required before a rename or reflective blog post.
+
+Deduplication is automatic. Delete a raw transcript only after its current path and modification time are covered by `ingest_watermark`, and after any durable lesson has been promoted into a recipe or canonical project documentation.
+
+### Codex closeout and retention
+
+The global `$session-closeout` skill handles the judgment step that automatic mining cannot. Invoke it explicitly, or use closeout language such as `close out this task`, `wrap this session up`, `prepare this task for archive`, or `make this archive-ready`. The prompt hook routes those phrases to the skill; the skill verifies evidence, promotes a reusable recipe only when warranted, and emits an `Archive-safe: yes|no` receipt. It never archives or deletes a task.
+
+Review and trust newly added hooks through Codex's `/hooks` interface. A practical retention policy is:
+
+1. Close out substantive tasks before archiving them.
+2. Keep canonical project truth in the owning repository and reusable procedures in `recall.db`; do not create recap files for chronology alone.
+3. Let `SessionEnd` enqueue the transcript and let the launchd worker advance its watermark.
+4. Keep a short grace window for archived raw transcripts, then delete only files whose exact path and current modification time remain covered by `ingest_watermark`.
+5. Keep active task transcripts. Prune disposable build artifacts in Codex worktrees independently; they are not session memory.
+
+Run `python3 poe-extract.py retention-report --grace-days 7` before any transcript cleanup. The report separates covered, recent, uncovered, and changed files. It always returns `deletion_authorized: false`; a watermark proves that bytes were ingested, not that the session's durable lessons were promoted.
 
 ## Automatic scanning (session-end hook)
 

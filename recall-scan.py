@@ -39,6 +39,70 @@ def get_existing_session_ids() -> set:
     return {r[0] for r in rows}
 
 
+# Sessions whose opening prompt was written by a machine, not by the operator.
+# Measured 2026-08-07: three of the top six scoring sessions over three days were
+# auto commit-review runs. Nominating those floods the queue with work nobody
+# chose to do. Kept local to nomination rather than folded into poe-extract's
+# NOISE_PREFIXES, which governs voice mining and has a wider blast radius.
+MACHINE_PROMPT_MARKERS = (
+    "Review a single git commit",
+    "[Request interrupted",
+    "This session is being continued",
+    "Caveat: The messages below",
+    "<local-command-caveat>",
+    "<command-name>",
+    "<command-message>",
+    "<bash-input>",
+    "<task-notification>",
+    "<teammate-message",
+    "<agent-message",
+    "Another Claude session sent a message",
+)
+
+
+def is_machine_authored(first_prompt: str | None) -> bool:
+    return bool(first_prompt) and first_prompt.lstrip().startswith(
+        MACHINE_PROMPT_MARKERS
+    )
+
+
+NOMINATIONS_PATH = Path(
+    os.environ.get(
+        "RECALL_NOMINATIONS",
+        Path.home() / ".claude" / "recall-nominations.json",
+    )
+)
+
+
+def read_nomination_file() -> dict:
+    if not NOMINATIONS_PATH.exists():
+        return {}
+    try:
+        return json.loads(NOMINATIONS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def read_declined() -> set:
+    """Session IDs the operator has already turned down."""
+    return set(read_nomination_file().get("declined") or [])
+
+
+def write_nominations(candidates: list[dict]) -> None:
+    """Replace the open nomination queue, preserving the declined list.
+
+    Nominations are regenerated from a fresh scan every run rather than
+    appended, so a session that gets saved or declined drops out on its own.
+    """
+    payload = {
+        "generated_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "nominations": candidates,
+        "declined": sorted(read_declined()),
+    }
+    NOMINATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    NOMINATIONS_PATH.write_text(json.dumps(payload, indent=2) + "\n")
+
+
 def analyze_session(session_file: Path) -> dict | None:
     """Extract key metrics from a session JSONL file."""
     tool_counts = Counter()
@@ -282,9 +346,51 @@ def main():
         default=20,
         help="Max candidates to return",
     )
+    parser.add_argument(
+        "--write-nominations",
+        action="store_true",
+        help="write the results to the nomination queue the SessionStart nudge reads",
+    )
+    parser.add_argument(
+        "--decline",
+        metavar="SESSION_ID",
+        action="append",
+        help="record that a nominated session was turned down; repeatable",
+    )
     args = parser.parse_args()
 
+    if args.decline:
+        existing_file = read_nomination_file()
+        declined = set(existing_file.get("declined") or []) | set(args.decline)
+        remaining = [
+            n
+            for n in (existing_file.get("nominations") or [])
+            if n.get("session_id") not in declined
+        ]
+        NOMINATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        NOMINATIONS_PATH.write_text(
+            json.dumps(
+                {
+                    "generated_at": existing_file.get("generated_at"),
+                    "nominations": remaining,
+                    "declined": sorted(declined),
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        print(
+            json.dumps(
+                {"declined": sorted(set(args.decline)), "remaining": len(remaining)}
+            )
+        )
+        return
+
     existing = get_existing_session_ids()
+    # Declining a nomination has to stick. Without this the same session is
+    # re-nominated on every scan and the nudge trains you to ignore it.
+    declined = read_declined()
+    existing |= declined
 
     # Determine time cutoff
     if args.days == "all":
@@ -326,6 +432,10 @@ def main():
                 total_skipped_noise += 1
                 continue
 
+            if is_machine_authored(session.get("first_prompt")):
+                total_skipped_noise += 1
+                continue
+
             session["project"] = project_name
             score, reason = score_recall_worthiness(session)
             session["recall_score"] = score
@@ -364,6 +474,11 @@ def main():
             for c in candidates
         ],
     }
+
+    if args.write_nominations:
+        write_nominations(output["candidates"])
+        output["scan_summary"]["nominations_written_to"] = str(NOMINATIONS_PATH)
+        output["scan_summary"]["declined_skipped"] = len(declined)
 
     print(json.dumps(output, indent=2))
 

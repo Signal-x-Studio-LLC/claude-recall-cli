@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "queue-session-recall",
+            "command": "python3 ~/Workspace/dev/tools/claude-recall-cli/poe-extract.py enqueue",
+            "timeout": 3000,
+            "description": "Queue this retained transcript for local mining"
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "recall-context": {
+      "command": "/bin/zsh",
+      "args": [
+        "-lc",
+        "exec \"$RECALL_CLI_DIR/adapters/mcp-remote-with-secret.sh\""
+      ],
+      "env": {
+        "RECALL_CLI_DIR": "$RECALL_CLI_DIR",
+        "RECALL_CONTEXT_URL": "$RECALL_CONTEXT_URL",
+        "RECALL_CONTEXT_1PASSWORD_ITEM": "$RECALL_CONTEXT_1PASSWORD_ITEM"
+      },
+      "includeTools": [
+        "search_memory",
+        "list_memory_candidates",
+        "get_memory",
+        "set_memory_status",
+        "get_ingest_receipt"
+      ],
+      "timeout": 45000,
+      "trust": false
+    }
+  }
+}
+

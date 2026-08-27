@@ -1,0 +1,10 @@
+# Merge this table into ~/.codex/config.toml.
+# Replace the Worker URL and inject RECALL_CONTEXT_TOKEN into Codex's environment.
+[mcp_servers.recall_context]
+url = "https://recall-context-plane.REPLACE_WITH_ACCOUNT_SUBDOMAIN.workers.dev/mcp"
+bearer_token_env_var = "RECALL_CONTEXT_TOKEN"
+enabled_tools = ["search_memory", "list_memory_candidates", "get_memory", "set_memory_status", "get_ingest_receipt"]
+default_tools_approval_mode = "writes"
+startup_timeout_sec = 20
+tool_timeout_sec = 45
+enabled = true

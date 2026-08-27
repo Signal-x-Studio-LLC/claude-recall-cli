@@ -24,14 +24,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+CODEX_ARCHIVED_SESSIONS_DIR = Path.home() / ".codex" / "archived_sessions"
+GEMINI_SESSIONS_DIR = Path.home() / ".gemini" / "tmp"
 POE_DIR = Path.home() / ".claude" / "poe"
 CORPUS_PATH = POE_DIR / "corpus.jsonl"
 STACK_PATH = POE_DIR / "stack.md"
@@ -67,6 +72,22 @@ NOISE_PREFIXES = (
     "<teammate-message",
     "<agent-message",
     "Another Claude session sent a message",
+    # Our OWN hooks' feedback. Claude Code injects a Stop hook's `reason` as a
+    # user turn, so anti-hesitation.py's prose was being ingested as Nino
+    # correcting the agent — 272 rows, 32% of the correction/rejection corpus
+    # as of 2026-08-26, and the single most common "correction" in it. A corpus
+    # that feeds the prompt-hook was training the agent on its own voice.
+    "Stop hook feedback:",
+    "PreToolUse hook feedback:",
+    "PostToolUse hook feedback:",
+    "UserPromptSubmit hook feedback:",
+    "SessionStart hook feedback:",
+    # Slash-command / subagent prompt templates that arrive on the user turn.
+    "Review a single git commit",
+    # Codex wraps a delegated thread's handoff in this envelope and delivers it
+    # on the user turn. It carries the parent agent's summary, not Nino's — 10
+    # of its 11 rows scored as corrections.
+    "<codex_delegation>",
 )
 
 # Messages dominated by pasted logs/code/tool output are not user voice.
@@ -125,6 +146,7 @@ SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS voice_signals (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id      TEXT NOT NULL,
+    source_client   TEXT NOT NULL DEFAULT 'claude',
     project         TEXT,
     timestamp       TEXT,
     signal_type     TEXT NOT NULL,
@@ -166,6 +188,7 @@ END;
 -- on-disk mtime to last_mtime_ns; advancing the watermark is the commit.
 CREATE TABLE IF NOT EXISTS ingest_watermark (
     session_path    TEXT PRIMARY KEY,
+    source_client   TEXT NOT NULL DEFAULT 'claude',
     last_mtime_ns   INTEGER NOT NULL,
     last_ingested   TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -185,6 +208,7 @@ CREATE TABLE IF NOT EXISTS ingest_meta (
 CREATE TABLE IF NOT EXISTS validated_responses (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id      TEXT NOT NULL,
+    source_client   TEXT NOT NULL DEFAULT 'claude',
     project         TEXT,
     timestamp       TEXT,
     response_text   TEXT NOT NULL,
@@ -234,10 +258,25 @@ def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(RECALL_DB))
     needs_rebuild = _migrate_fts_tokenizer(conn)
     conn.executescript(SCHEMA_SQL)
+    _migrate_source_provenance(conn)
     if needs_rebuild:
         conn.execute("INSERT INTO voice_signals_fts(voice_signals_fts) VALUES('rebuild')")
         conn.commit()
     return conn
+
+
+def _migrate_source_provenance(conn: sqlite3.Connection) -> None:
+    """Add cross-client provenance to databases created before Codex ingest."""
+    for table in ("voice_signals", "validated_responses", "ingest_watermark"):
+        columns = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if "source_client" not in columns:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN "
+                "source_client TEXT NOT NULL DEFAULT 'claude'"
+            )
+    conn.commit()
 
 
 def phrase_hash(phrase: str) -> str:
@@ -253,7 +292,19 @@ _WORKSPACE_PREFIX = str(Path.home() / "Workspace") + "/"
 def _cwd_to_label(cwd: str) -> str:
     """Render a cwd as a short, readable project label.
     /Users/nino/Workspace/dev/wip/aisles-storefront -> wip/aisles-storefront
-    /Users/nino/foo -> foo"""
+    /Users/nino/foo -> foo
+
+    Transcript paths may come from another machine, so do not require the
+    recorded home directory to match Path.home() on the ingest machine.
+    """
+    parts = Path(cwd).parts
+    if "Workspace" in parts:
+        workspace_index = parts.index("Workspace")
+        rel_parts = list(parts[workspace_index + 1:])
+        if rel_parts and rel_parts[0] == "dev":
+            rel_parts = rel_parts[1:]
+        if rel_parts:
+            return "/".join(rel_parts)
     if cwd.startswith(_WORKSPACE_PREFIX):
         rel = cwd[len(_WORKSPACE_PREFIX):]
         # Drop the 'dev/' segment — it's nearly all of them, adds no information.
@@ -262,12 +313,25 @@ def _cwd_to_label(cwd: str) -> str:
         return rel
     if cwd.startswith(_HOME_PREFIX):
         return cwd[len(_HOME_PREFIX):]
+    if len(parts) >= 4 and parts[0] == "/" and parts[1] in {"Users", "home"}:
+        return "/".join(parts[3:])
     return cwd
 
 
 def _read_cwd(session_file: Path) -> str | None:
-    """Peek the JSONL for the first entry that has a cwd field. Cheap — usually
-    in the first or second line. Returns None if not found."""
+    """Read the transcript's project root without scanning tool payloads."""
+    if transcript_source(session_file) == "gemini":
+        try:
+            data = json.loads(session_file.read_text(errors="replace"))
+            directories = data.get("directories")
+            if isinstance(directories, list) and directories:
+                return str(directories[0])
+            marker = session_file.parent.parent / ".project_root"
+            if marker.exists():
+                return marker.read_text(errors="replace").strip() or None
+        except (OSError, json.JSONDecodeError):
+            return None
+        return None
     try:
         with open(session_file, "r", errors="replace") as f:
             for i, line in enumerate(f):
@@ -280,7 +344,10 @@ def _read_cwd(session_file: Path) -> str | None:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                payload = obj.get("payload")
                 cwd = obj.get("cwd")
+                if not cwd and isinstance(payload, dict):
+                    cwd = payload.get("cwd")
                 if cwd:
                     return cwd
     except OSError:
@@ -294,14 +361,232 @@ def project_label_for(session_file: Path) -> str:
     cwd = _read_cwd(session_file)
     if cwd:
         return _cwd_to_label(cwd)
+    if transcript_source(session_file) == "gemini":
+        project_dir = session_file.parent.parent
+        project_key = project_dir.name
+        if re.fullmatch(r"[0-9a-f]{64}", project_key, re.IGNORECASE):
+            return f"gemini/{project_key[:12]}"
+        if project_key and project_key != "tmp":
+            return project_key
     # Fallback: best-effort decode of Claude Code's dirname encoding.
-    # Leading '-' marker, then path segments joined by '-'. Strip the
-    # /Users/nino/ home prefix if present and leave the rest as-is (no
-    # lossy dash-to-slash substitution).
+    # Leading '-' marker, then path segments joined by '-'. The user name is
+    # ambiguous once encoded (for example nino-chavez), so anchor on the
+    # Workspace segment instead of hardcoding one machine's home directory.
     name = session_file.parent.name
-    if name.startswith("-Users-nino-"):
-        return name[len("-Users-nino-"):]
+    for marker in ("-Workspace-dev-", "-Workspace-"):
+        if marker in name:
+            return name.split(marker, 1)[1] or "unknown-project"
+    if name.startswith(("-Users-", "-home-")):
+        return "unknown-project"
     return name
+
+
+def transcript_source(session_file: Path) -> str:
+    """Detect the transcript producer without depending only on its location."""
+    path = str(session_file)
+    if "/.codex/" in path:
+        return "codex"
+    if "/.gemini/" in path:
+        return "gemini"
+    if "/.claude/" in path:
+        return "claude"
+    if session_file.suffix == ".json":
+        try:
+            data = json.loads(session_file.read_text(errors="replace"))
+            if isinstance(data, dict) and isinstance(data.get("messages"), list):
+                return "gemini"
+        except (OSError, json.JSONDecodeError):
+            pass
+    try:
+        with open(session_file, "r", errors="replace") as stream:
+            for index, line in enumerate(stream):
+                if index > 20:
+                    break
+                if '"type":"session_meta"' in line or '"type": "session_meta"' in line:
+                    return "codex"
+                if '"type":"event_msg"' in line or '"type": "event_msg"' in line:
+                    return "codex"
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") in {"user", "assistant"}:
+                    return "claude"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def session_id_for(session_file: Path) -> str:
+    """Return the product session id, not Codex's rollout filename stem."""
+    source = transcript_source(session_file)
+    if source == "gemini":
+        try:
+            data = json.loads(session_file.read_text(errors="replace"))
+            if data.get("sessionId"):
+                return str(data["sessionId"])
+        except (OSError, json.JSONDecodeError):
+            pass
+    if source == "codex":
+        try:
+            with open(session_file, "r", errors="replace") as stream:
+                for index, line in enumerate(stream):
+                    if index > 20:
+                        break
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("type") != "session_meta":
+                        continue
+                    payload = obj.get("payload")
+                    if isinstance(payload, dict):
+                        value = payload.get("id") or payload.get("session_id")
+                        if value:
+                            return str(value)
+        except OSError:
+            pass
+        match = re.search(
+            r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+            session_file.stem,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1)
+    return session_file.stem
+
+
+# Codex writes one rollout per *agent*, not per conversation. 89% of the files
+# under ~/.codex/sessions are subagents: 454 "guardian" permission-classifier
+# sessions plus every thread_spawn child. Their `user_message` events are
+# written by Codex or by a parent agent — never by Nino — and the guardian's
+# prompt embeds the parent transcript verbatim, so ingesting it filed the
+# agent's own prose as Nino correcting the agent, replayed once per assessment.
+# (2026-08-26: 866 of 1008 codex rows were 40 messages repeated this way.)
+#
+# session_meta.payload.source says so structurally. Real sessions carry a
+# string ("vscode"); subagents carry {"subagent": {...}}.
+_CODEX_SUBAGENT_CACHE: dict[str, str | None] = {}
+
+
+def codex_subagent_kind(session_file: Path) -> str | None:
+    """Name of the subagent that owns this rollout, or None for a real session."""
+    key = str(session_file)
+    if key in _CODEX_SUBAGENT_CACHE:
+        return _CODEX_SUBAGENT_CACHE[key]
+    kind: str | None = None
+    try:
+        with open(session_file, "r", errors="replace") as stream:
+            for index, line in enumerate(stream):
+                if index > 20:
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "session_meta":
+                    continue
+                payload = obj.get("payload")
+                source = payload.get("source") if isinstance(payload, dict) else None
+                if isinstance(source, dict) and "subagent" in source:
+                    inner = source.get("subagent")
+                    if isinstance(inner, dict):
+                        kind = next(iter(inner.keys()), "subagent")
+                        if kind == "other" and isinstance(inner.get("other"), str):
+                            kind = inner["other"]
+                    else:
+                        kind = "subagent"
+                break
+    except OSError:
+        kind = None
+    _CODEX_SUBAGENT_CACHE[key] = kind
+    return kind
+
+
+def _claude_message_text(obj: dict) -> str | None:
+    """Extract prose from a Claude user/assistant event; reject tool results."""
+    message = obj.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    texts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_result":
+            return None
+        if block.get("type") == "text" and block.get("text"):
+            texts.append(str(block["text"]))
+    return " ".join(texts) if texts else None
+
+
+def iter_transcript_messages(session_file: Path):
+    """Yield normalized `(timestamp, role, phase, text)` message events."""
+    source = transcript_source(session_file)
+    if source == "codex" and codex_subagent_kind(session_file):
+        # Not Nino's voice. See codex_subagent_kind.
+        return
+    if source == "gemini":
+        try:
+            data = json.loads(session_file.read_text(errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            return
+        for message in data.get("messages", []):
+            if not isinstance(message, dict):
+                continue
+            event_type = message.get("type")
+            role = (
+                "user"
+                if event_type == "user"
+                else "assistant"
+                if event_type == "gemini"
+                else None
+            )
+            text = message.get("content")
+            if role and isinstance(text, str) and text.strip():
+                yield message.get("timestamp", ""), role, None, text
+        return
+    try:
+        with open(session_file, "r", errors="replace") as stream:
+            for line in stream:
+                # Codex tool outputs can be enormous. Only event_msg records contain
+                # the human and agent prose this corpus is allowed to ingest.
+                if source == "codex" and (
+                    '"type":"event_msg"' not in line
+                    and '"type": "event_msg"' not in line
+                ):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                timestamp = obj.get("timestamp", "")
+                if source == "codex":
+                    payload = obj.get("payload")
+                    if obj.get("type") != "event_msg" or not isinstance(payload, dict):
+                        continue
+                    event_type = payload.get("type")
+                    text = payload.get("message")
+                    if not isinstance(text, str) or not text.strip():
+                        continue
+                    if event_type == "user_message":
+                        yield timestamp, "user", None, text
+                    elif event_type == "agent_message":
+                        yield timestamp, "assistant", payload.get("phase"), text
+                    continue
+
+                event_type = obj.get("type")
+                if event_type not in {"user", "assistant"}:
+                    continue
+                text = _claude_message_text(obj)
+                if text:
+                    yield timestamp, event_type, None, text
+    except OSError:
+        return
 
 
 def iter_user_messages(session_file: Path):
@@ -309,79 +594,26 @@ def iter_user_messages(session_file: Path):
     Deduplicates messages within a session (sidechain entries duplicate main chain)."""
     prior_assistant = ""
     seen_msgs: set[str] = set()
-    try:
-        with open(session_file, "r", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                t = obj.get("type")
-                ts = obj.get("timestamp", "")
-
-                if t == "assistant":
-                    msg = obj.get("message", {})
-                    content = msg.get("content", [])
-                    if isinstance(content, list):
-                        texts = [
-                            c.get("text", "")
-                            for c in content
-                            if isinstance(c, dict) and c.get("type") == "text"
-                        ]
-                        if texts:
-                            prior_assistant = " ".join(texts)[:600]
-                    continue
-
-                if t != "user":
-                    continue
-
-                msg = obj.get("message", {})
-                content = msg.get("content", "")
-
-                # Extract only real text user messages, skip tool_result
-                text = None
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    for c in content:
-                        if not isinstance(c, dict):
-                            continue
-                        if c.get("type") == "tool_result":
-                            text = None
-                            break
-                        if c.get("type") == "text":
-                            text = c.get("text", "")
-                            break
-
-                if not text:
-                    continue
-
-                text = text.strip()
-                if len(text) < MIN_USER_MSG_LEN or len(text) > MAX_USER_MSG_LEN * 4:
-                    continue
-                if text.startswith(NOISE_PREFIXES):
-                    continue
-                # Skip messages that are mostly tags/code dumps
-                if text.count("<") > 20 or text.count("```") > 6:
-                    continue
-
-                # Dedupe within session (sidechain duplicates)
-                msg_key = text[:200]
-                if msg_key in seen_msgs:
-                    continue
-                seen_msgs.add(msg_key)
-
-                yield (
-                    ts,
-                    redact_secrets(text[:MAX_USER_MSG_LEN]),
-                    redact_secrets(prior_assistant),
-                )
-    except Exception:
-        return
+    for timestamp, role, _phase, text in iter_transcript_messages(session_file):
+        if role == "assistant":
+            prior_assistant = text[:600]
+            continue
+        text = text.strip()
+        if len(text) < MIN_USER_MSG_LEN or len(text) > MAX_USER_MSG_LEN * 4:
+            continue
+        if text.startswith(NOISE_PREFIXES):
+            continue
+        if text.count("<") > 20 or text.count("```") > 6:
+            continue
+        msg_key = text[:200]
+        if msg_key in seen_msgs:
+            continue
+        seen_msgs.add(msg_key)
+        yield (
+            timestamp,
+            redact_secrets(text[:MAX_USER_MSG_LEN]),
+            redact_secrets(prior_assistant),
+        )
 
 
 # Credential-shaped strings, redacted at ingest. Nino pastes real keys into
@@ -555,54 +787,23 @@ def iter_pairs(session_file: Path):
     assistant→user pair in the JSONL."""
     pending_assistant: str | None = None
     pending_ts = ""
-    try:
-        with open(session_file, "r", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                t = obj.get("type")
-                ts = obj.get("timestamp", "")
-                if t == "assistant":
-                    msg = obj.get("message", {})
-                    content = msg.get("content", [])
-                    if isinstance(content, list):
-                        texts = [
-                            c.get("text", "") for c in content
-                            if isinstance(c, dict) and c.get("type") == "text"
-                        ]
-                        if texts:
-                            pending_assistant = " ".join(texts).strip()
-                            pending_ts = ts
-                elif t == "user" and pending_assistant:
-                    msg = obj.get("message", {})
-                    content = msg.get("content", "")
-                    text = None
-                    if isinstance(content, str):
-                        text = content
-                    elif isinstance(content, list):
-                        for c in content:
-                            if not isinstance(c, dict):
-                                continue
-                            if c.get("type") == "tool_result":
-                                text = None
-                                break
-                            if c.get("type") == "text":
-                                text = c.get("text", "")
-                                break
-                    if text:
-                        yield (
-                            redact_secrets(pending_assistant),
-                            redact_secrets(text.strip()),
-                            pending_ts,
-                        )
-                    pending_assistant = None
-    except OSError:
-        return
+    source = transcript_source(session_file)
+    for timestamp, role, phase, text in iter_transcript_messages(session_file):
+        if role == "assistant":
+            # Commentary is useful as correction context, but it is not a
+            # completed response shape and must not become a positive exemplar.
+            if source == "codex" and phase != "final_answer":
+                continue
+            pending_assistant = text.strip()
+            pending_ts = timestamp
+            continue
+        if role == "user" and pending_assistant:
+            yield (
+                redact_secrets(pending_assistant),
+                redact_secrets(text.strip()),
+                pending_ts,
+            )
+            pending_assistant = None
 
 
 def _extract_validated_from_file(jf: Path) -> list[dict]:
@@ -610,7 +811,8 @@ def _extract_validated_from_file(jf: Path) -> list[dict]:
     Excludes turns where the assistant text is dominated by tool-use markers
     or is trivially short (no behavioral signal)."""
     project = project_label_for(jf)
-    session_id = jf.stem
+    source_client = transcript_source(jf)
+    session_id = session_id_for(jf)
     out: list[dict] = []
     for assistant_text, follow_text, ts in iter_pairs(jf):
         # Filter: skip very short or near-empty assistant turns.
@@ -627,6 +829,7 @@ def _extract_validated_from_file(jf: Path) -> list[dict]:
         out.append({
             "project": project,
             "session_id": session_id,
+            "source_client": source_client,
             "timestamp": ts,
             "response_text": assistant_text[:2000],
             "response_chars": len(assistant_text),
@@ -644,12 +847,13 @@ def _upsert_validated(conn: sqlite3.Connection, records: list[dict]) -> int:
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO validated_responses
-                    (session_id, project, timestamp, response_text, response_chars,
+                    (session_id, source_client, project, timestamp, response_text, response_chars,
                      shape_signature, follow_label, response_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    r["session_id"], r.get("project"), r.get("timestamp") or "",
+                    r["session_id"], r.get("source_client", "claude"),
+                    r.get("project"), r.get("timestamp") or "",
                     r["response_text"], r["response_chars"],
                     r["shape_signature"], r.get("follow_label"), r["response_hash"],
                 ),
@@ -665,7 +869,8 @@ def _upsert_validated(conn: sqlite3.Connection, records: list[dict]) -> int:
 def _extract_from_file(jf: Path) -> list[dict]:
     """Extract all signal records from a single JSONL file."""
     project = project_label_for(jf)
-    session_id = jf.stem
+    source_client = transcript_source(jf)
+    session_id = session_id_for(jf)
     records: list[dict] = []
     for ts, text, prior in iter_user_messages(jf):
         hits = extract_signals(text)
@@ -673,6 +878,7 @@ def _extract_from_file(jf: Path) -> list[dict]:
             records.append({
                 "project": project,
                 "session_id": session_id,
+                "source_client": source_client,
                 "timestamp": ts,
                 "signal": stype,
                 "label": label,
@@ -691,12 +897,13 @@ def _upsert_signals(conn: sqlite3.Connection, records: list[dict]) -> int:
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO voice_signals
-                    (session_id, project, timestamp, signal_type, label,
+                    (session_id, source_client, project, timestamp, signal_type, label,
                      phrase, message, prior_assistant, phrase_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     r["session_id"],
+                    r.get("source_client", "claude"),
                     r.get("project"),
                     r.get("timestamp") or "",
                     r["signal"],
@@ -723,16 +930,19 @@ def _watermark_get(conn: sqlite3.Connection, path: str) -> int:
     return row[0] if row else 0
 
 
-def _watermark_set(conn: sqlite3.Connection, path: str, mtime_ns: int) -> None:
+def _watermark_set(
+    conn: sqlite3.Connection, path: str, mtime_ns: int, source_client: str
+) -> None:
     conn.execute(
         """
-        INSERT INTO ingest_watermark (session_path, last_mtime_ns)
-        VALUES (?, ?)
+        INSERT INTO ingest_watermark (session_path, source_client, last_mtime_ns)
+        VALUES (?, ?, ?)
         ON CONFLICT(session_path) DO UPDATE SET
+            source_client = excluded.source_client,
             last_mtime_ns = excluded.last_mtime_ns,
             last_ingested = datetime('now')
         """,
-        (path, mtime_ns),
+        (path, source_client, mtime_ns),
     )
 
 
@@ -759,38 +969,52 @@ def _ingest_file(conn: sqlite3.Connection, jf: Path) -> tuple[int, int]:
     except FileNotFoundError:
         return (0, 0)
     path_str = str(jf)
+    source_client = transcript_source(jf)
     if _watermark_get(conn, path_str) >= mtime_ns:
         return (0, 0)
     records = _extract_from_file(jf)
     inserted = _upsert_signals(conn, records)
     validated = _extract_validated_from_file(jf)
     v_inserted = _upsert_validated(conn, validated)
-    _watermark_set(conn, path_str, mtime_ns)
+    _watermark_set(conn, path_str, mtime_ns, source_client)
     conn.commit()
     # Roll validated inserts into the "anything changed?" count so catchup
     # rebuilds stack.md when only reverse-Poe data is new.
     return (len(records) + len(validated), inserted + v_inserted)
 
 
-def _iter_session_files() -> list[Path]:
+def _iter_session_files(
+    include_codex: bool = False, include_gemini: bool = False
+) -> list[Path]:
     files: list[Path] = []
-    if not PROJECTS_DIR.exists():
-        return files
-    for proj_dir in sorted(PROJECTS_DIR.iterdir()):
-        if not proj_dir.is_dir():
-            continue
-        files.extend(proj_dir.glob("*.jsonl"))
-    return files
+    if PROJECTS_DIR.exists():
+        for proj_dir in sorted(PROJECTS_DIR.iterdir()):
+            if proj_dir.is_dir():
+                files.extend(proj_dir.glob("*.jsonl"))
+    if include_codex:
+        if CODEX_SESSIONS_DIR.exists():
+            files.extend(CODEX_SESSIONS_DIR.rglob("*.jsonl"))
+        if CODEX_ARCHIVED_SESSIONS_DIR.exists():
+            files.extend(CODEX_ARCHIVED_SESSIONS_DIR.glob("*.jsonl"))
+    if include_gemini and GEMINI_SESSIONS_DIR.exists():
+        files.extend(GEMINI_SESSIONS_DIR.glob("*/chats/session-*.json"))
+    return sorted(set(files))
 
 
-def cmd_catchup(verbose: bool = False) -> None:
+def cmd_catchup(
+    verbose: bool = False,
+    include_codex: bool = False,
+    include_gemini: bool = False,
+) -> None:
     """Ingest every session file with mtime newer than its watermark.
 
     Idempotent: re-running with no new data is near-zero cost (one stat
     per file, no extraction, no DB writes beyond the meta timestamp).
     Safe to invoke from any trigger — hook drain, schedule, read path."""
     conn = db_connect()
-    files = _iter_session_files()
+    files = _iter_session_files(
+        include_codex=include_codex, include_gemini=include_gemini
+    )
     scanned = 0
     ingested_files = 0
     total_signals = 0
@@ -808,19 +1032,137 @@ def cmd_catchup(verbose: bool = False) -> None:
     if verbose or ingested_files:
         print(
             f"catchup: {scanned} scanned, {ingested_files} ingested, "
-            f"{total_inserted}/{total_signals} new signals",
+            f"{total_inserted}/{total_signals} new mined records",
             file=sys.stderr,
         )
     # Stack.md is the human/LLM-facing artifact. Rebuild it when the corpus
     # changed so the consumer never reads stale signals.
     if total_inserted > 0:
+        cmd_assemble(_skip_catchup=True)
+
+
+def build_retention_report(
+    conn: sqlite3.Connection,
+    archive_dir: Path,
+    grace_days: int = 7,
+    now: datetime | None = None,
+    list_covered: bool = False,
+) -> dict:
+    """Measure watermark-covered archived Codex transcripts without deleting them.
+
+    Watermark coverage proves ingestion, not semantic closeout or promotion, so
+    this report never declares a file safe to delete.
+    """
+    if grace_days < 0:
+        raise ValueError("grace_days must be zero or greater")
+    archive_exists = archive_dir.is_dir()
+
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    grace_seconds = grace_days * 86400
+    totals = {
+        "watermark_covered": {"files": 0, "bytes": 0},
+        "too_recent": {"files": 0, "bytes": 0},
+        "uncovered": {"files": 0, "bytes": 0},
+        "changed_after_ingest": {"files": 0, "bytes": 0},
+        "errors": {"files": 0, "bytes": 0},
+    }
+    covered: list[dict] = []
+
+    transcripts = sorted(archive_dir.glob("*.jsonl")) if archive_exists else []
+    for transcript in transcripts:
         try:
-            cmd_assemble(_skip_catchup=True)
-        except Exception as e:
-            print(f"stack rebuild failed: {e}", file=sys.stderr)
+            stat = transcript.stat()
+        except OSError:
+            totals["errors"]["files"] += 1
+            continue
+
+        row = conn.execute(
+            "SELECT last_mtime_ns FROM ingest_watermark WHERE session_path = ?",
+            (str(transcript),),
+        ).fetchone()
+        watermark_ns = int(row[0]) if row else 0
+        age_seconds = max(0.0, reference.timestamp() - stat.st_mtime)
+
+        if not watermark_ns:
+            bucket = "uncovered"
+        elif watermark_ns < stat.st_mtime_ns:
+            bucket = "changed_after_ingest"
+        elif age_seconds < grace_seconds:
+            bucket = "too_recent"
+        else:
+            bucket = "watermark_covered"
+
+        totals[bucket]["files"] += 1
+        totals[bucket]["bytes"] += stat.st_size
+        if bucket == "watermark_covered" and list_covered:
+            covered.append(
+                {
+                    "path": str(transcript),
+                    "bytes": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "watermark_ns": watermark_ns,
+                    "age_days": round(age_seconds / 86400, 2),
+                }
+            )
+
+    report = {
+        "source_client": "codex",
+        "archive_dir": str(archive_dir),
+        "archive_exists": archive_exists,
+        "grace_days": grace_days,
+        "scanned_files": sum(bucket["files"] for bucket in totals.values()),
+        **totals,
+        "deletion_authorized": False,
+        "note": (
+            "Watermark coverage proves ingestion only. Delete nothing until "
+            "human closeout confirms durable lessons and project truth were promoted."
+        ),
+    }
+    if list_covered:
+        report["covered_files"] = covered
+    return report
 
 
-def cmd_drain_queue(verbose: bool = False) -> None:
+def cmd_retention_report(grace_days: int = 7, list_covered: bool = False) -> None:
+    conn = db_connect()
+    try:
+        report = build_retention_report(
+            conn,
+            CODEX_ARCHIVED_SESSIONS_DIR,
+            grace_days=grace_days,
+            list_covered=list_covered,
+        )
+    finally:
+        conn.close()
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
+def _resolve_queued_transcript(entry: dict) -> Path | None:
+    """Resolve a queued transcript after Codex may have archived/moved it."""
+    raw_path = entry.get("transcript_path") or entry.get("session_file") or ""
+    if raw_path:
+        path = Path(str(raw_path)).expanduser()
+        if path.exists():
+            return path
+    source_client = entry.get("source_client") or entry.get("source")
+    session_id = str(entry.get("session_id") or "").strip()
+    if source_client != "codex" or not session_id:
+        return None
+    candidates: list[Path] = []
+    if CODEX_SESSIONS_DIR.exists():
+        candidates.extend(CODEX_SESSIONS_DIR.rglob(f"*{session_id}*.jsonl"))
+    if CODEX_ARCHIVED_SESSIONS_DIR.exists():
+        candidates.extend(CODEX_ARCHIVED_SESSIONS_DIR.glob(f"*{session_id}*.jsonl"))
+    return max(candidates, key=lambda item: item.stat().st_mtime_ns) if candidates else None
+
+
+def cmd_drain_queue(
+    verbose: bool = False,
+    include_codex: bool = False,
+    include_gemini: bool = False,
+) -> None:
     """Drain ~/.claude/poe/queue, ingesting each listed transcript path.
 
     The queue is a newline-delimited file of transcript paths written by
@@ -833,25 +1175,46 @@ def cmd_drain_queue(verbose: bool = False) -> None:
         # Nothing queued, but still run a watermark sweep so the worker
         # is self-healing if WatchPaths missed an event.
         conn.close()
-        cmd_catchup(verbose=verbose)
+        cmd_catchup(
+            verbose=verbose,
+            include_codex=include_codex,
+            include_gemini=include_gemini,
+        )
         return
     tmp = QUEUE_PATH.with_suffix(".draining")
     try:
         QUEUE_PATH.rename(tmp)
     except FileNotFoundError:
         conn.close()
-        cmd_catchup(verbose=verbose)
+        cmd_catchup(
+            verbose=verbose,
+            include_codex=include_codex,
+            include_gemini=include_gemini,
+        )
         return
 
     paths: list[Path] = []
     seen: set[str] = set()
     with open(tmp, "r", errors="replace") as f:
         for line in f:
-            p = line.strip()
-            if not p or p in seen:
+            value = line.strip()
+            if not value:
                 continue
-            seen.add(p)
-            paths.append(Path(p))
+            if value.startswith("{"):
+                try:
+                    entry = json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+            else:
+                entry = {"transcript_path": value}
+            path = _resolve_queued_transcript(entry)
+            if path is None:
+                continue
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(path)
     tmp.unlink(missing_ok=True)
 
     ingested = 0
@@ -871,7 +1234,11 @@ def cmd_drain_queue(verbose: bool = False) -> None:
             file=sys.stderr,
         )
     # Belt-and-suspenders: catch any sessions the queue missed.
-    cmd_catchup(verbose=False)
+    cmd_catchup(
+        verbose=False,
+        include_codex=include_codex,
+        include_gemini=include_gemini,
+    )
 
 
 HEDGE_WORDS = {
@@ -1410,7 +1777,7 @@ def cmd_memory_link(promote_threshold: int = 5, verbose: bool = False) -> None:
     conn.close()
 
 
-def cmd_drift(verbose: bool = False) -> None:
+def cmd_drift_labels(verbose: bool = False) -> None:
     """Report preference labels that haven't been reinforced lately.
     A 'drift candidate' is a label that:
       - has historical signals (≥3 total occurrences)
@@ -1448,7 +1815,7 @@ def cmd_drift(verbose: bool = False) -> None:
         else:
             fresh.append((stype, label, total, age))
 
-    print("# Poe drift report")
+    print("# Poe label-drift report")
     print()
     print(f"_Labels with ≥3 historical signals, sorted by staleness._")
     print()
@@ -1467,6 +1834,264 @@ def cmd_drift(verbose: bool = False) -> None:
         for stype, label, total, age in fresh[:20]:
             print(f"- `{stype}/{label}` — {total} signals, last seen {int(age)}d ago")
         print()
+
+
+# --- Rule drift -------------------------------------------------------------
+#
+# A "rule" is a heading in a governing instruction doc. Reinforcement is
+# evidence the rule is still live: a mechanical enforcer names it, Nino
+# restated it in the corpus, or its section was edited recently.
+#
+# The demotion path this exists for: a promoted rule with no reinforcement is
+# a candidate for removal. Without one, the instruction set only grows — and
+# Codex truncates the merged AGENTS.md chain at 32 KiB. (2026-08-26: the 630
+# browser-profile rules were BOTH superseded and nothing surfaced them.)
+
+RULE_DOCS_DEFAULT = (
+    "~/.dotfiles/ways-of-working/*.md",
+    "~/.claude/CLAUDE.md",
+    "~/.codex/AGENTS.md",
+)
+
+# Vague heading words that would match almost any transcript.
+RULE_STOPWORDS = {
+    "about", "after", "again", "against", "agent", "agents", "always", "another",
+    "because", "before", "being", "below", "better", "between", "build", "check",
+    "claim", "claude", "codex", "default", "defaults", "every", "first", "index",
+    "instead", "learned", "level", "measured", "never", "notes", "other",
+    "prefer", "reference", "rules", "second", "should", "small", "still", "their",
+    "there", "these", "thing", "things", "third", "those", "under", "using",
+    "verified", "watch", "where", "which", "while", "would", "write", "writing",
+}
+
+# Something that mechanically enforces a rule. A rule with one of these is
+# alive whether or not anyone talks about it.
+ENFORCER_RE = re.compile(r"`?([a-z][a-z0-9-]*(?:-guard|-reaper|-hook)\.py|[a-z][a-z0-9-]*\.py)`?")
+IDENT_RE = re.compile(r"`([^`\n]{3,40})`")
+
+
+def _rule_docs() -> list[Path]:
+    """Governing docs to scan. Override with POE_RULE_DOCS (colon-separated)."""
+    raw = os.environ.get("POE_RULE_DOCS")
+    if raw:
+        # An explicit override is exhaustive; do not silently widen it.
+        globs = raw.split(":")
+    else:
+        globs = list(RULE_DOCS_DEFAULT)
+        # A repo's own governing docs count when run inside one.
+        root = _git_root(Path.cwd())
+        for name in ("CLAUDE.md", "AGENTS.md"):
+            if root and (root / name).exists():
+                globs.append(str(root / name))
+    import glob as _glob
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for g in globs:
+        g = os.path.expanduser(g.strip())
+        matches = [Path(m) for m in sorted(_glob.glob(g))] if "*" in g else [Path(g)]
+        for m in matches:
+            if not m.is_file():
+                continue
+            key = m.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(m)
+    return out
+
+
+def _git_root(start: Path) -> Path | None:
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(start), capture_output=True, text=True, timeout=4,
+        )
+        return Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    except Exception:
+        return None
+
+
+def _rule_sections(path: Path) -> list[dict]:
+    """Split a doc into heading-delimited rules. One heading == one rule."""
+    try:
+        lines = path.read_text(errors="ignore").splitlines()
+    except Exception:
+        return []
+    heads = [
+        (i, len(m.group(1)), m.group(2).strip())
+        for i, ln in enumerate(lines, 1)
+        for m in [re.match(r"^(#{2,3})\s+(.*)", ln)]
+        if m
+    ]
+    out = []
+    for n, (start, level, title) in enumerate(heads):
+        # A rule owns its sub-rules: run to the next heading at the same or a
+        # higher level, not merely the next heading. Otherwise a `##` rule with
+        # `###` children scores on its intro paragraph alone — which flagged
+        # "Never fabricate Nino's interior state" as drift while its own
+        # sub-rule was the most-reinforced section in the file.
+        end = len(lines)
+        for m in range(n + 1, len(heads)):
+            if heads[m][1] <= level:
+                end = heads[m][0] - 1
+                break
+        body = "\n".join(lines[start:end])
+        out.append(
+            {"doc": path, "title": title, "level": level,
+             "start": start, "end": max(start, end), "body": body}
+        )
+    return out
+
+
+def _rule_terms(rule: dict) -> list[str]:
+    """Distinctive strings whose presence in the corpus means the rule was invoked.
+
+    Backticked identifiers in the body are far better evidence than heading
+    words — `browse-tool` or `op://` only appear when the rule is in play,
+    while "discipline" appears everywhere.
+    """
+    terms: list[str] = []
+    for ident in IDENT_RE.findall(rule["body"])[:60]:
+        ident = ident.strip().lower()
+        if not ident or ident.isdigit() or " " in ident:
+            continue
+        # Distinctive = looks like an identifier/path, or is simply long. A
+        # bare `git` or `main` matches every transcript and proves nothing.
+        if any(ch in ident for ch in "-._/:") or len(ident) >= 8:
+            terms.append(ident)
+    for w in re.findall(r"[a-zA-Z][a-zA-Z-]{6,}", rule["title"]):
+        w = w.lower()
+        if w not in RULE_STOPWORDS:
+            terms.append(w)
+    seen, uniq = set(), []
+    for t in terms:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq[:25]
+
+
+def _rule_enforcers(rule: dict) -> list[str]:
+    hits = {m for m in ENFORCER_RE.findall(rule["body"])}
+    return sorted(h for h in hits if h.endswith(".py"))
+
+
+def _section_edit_age(rule: dict) -> float | None:
+    """Days since these exact lines last changed. None if not in git."""
+    doc = rule["doc"]
+    root = _git_root(doc.parent)
+    if not root:
+        return None
+    try:
+        rel = doc.resolve().relative_to(root.resolve())
+    except Exception:
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "log", "-n1", "--format=%cI", "-s",
+             "-L", f"{rule['start']},{rule['end']}:{rel}"],
+            cwd=str(root), capture_output=True, text=True, timeout=10,
+        )
+        stamp = r.stdout.strip().splitlines()[0] if r.stdout.strip() else ""
+    except Exception:
+        return None
+    return _signal_age_days(stamp) if stamp else None
+
+
+def cmd_drift(days: int = 90, verbose: bool = False, as_json: bool = False) -> None:
+    """Report rules in the governing docs with no recent reinforcement.
+
+    A rule is alive if a hook enforces it, if Nino restated it in the corpus
+    within the window, or if its section was edited within the window.
+    Everything else is a demotion candidate."""
+    docs = _rule_docs()
+    if not docs:
+        print("No rule docs found. Set POE_RULE_DOCS.", file=sys.stderr)
+        return
+    haystack = ""
+    if RECALL_DB.exists():
+        conn = db_connect()
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        rows = conn.execute(
+            "SELECT phrase, message FROM voice_signals WHERE timestamp >= ?", (since,)
+        ).fetchall()
+        conn.close()
+        haystack = " ".join(
+            (p or "").lower() + " " + (m or "").lower() for p, m in rows
+        )
+
+    results = []
+    for doc in docs:
+        for rule in _rule_sections(doc):
+            terms = _rule_terms(rule)
+            enforcers = _rule_enforcers(rule)
+            matched = [t for t in terms if len(t) >= 5 and t in haystack][:3] if haystack else []
+            edit_age = _section_edit_age(rule)
+            if enforcers:
+                verdict = "enforced"
+            elif matched:
+                verdict = "reinforced"
+            elif len(terms) < 2:
+                # One generic term is not enough to call a rule dead. "## Preferences"
+                # scores on the word "preferences" alone; absence of that word proves
+                # nothing. Unscorable is the honest verdict, and it names its own fix:
+                # reword the rule so it contains something distinctive.
+                verdict = "unscorable"
+            elif edit_age is not None and edit_age <= days:
+                verdict = "unproven"
+            else:
+                verdict = "drift"
+            results.append({
+                "doc": str(doc).replace(str(Path.home()), "~"),
+                "rule": rule["title"],
+                "lines": f"{rule['start']}-{rule['end']}",
+                "verdict": verdict,
+                "enforcers": enforcers,
+                "matched_terms": matched,
+                "edit_age_days": None if edit_age is None else int(edit_age),
+            })
+
+    if as_json:
+        print(json.dumps({"window_days": days, "rules": results}, indent=2))
+        return
+
+    by = defaultdict(list)
+    for r in results:
+        by[r["verdict"]].append(r)
+    drift = sorted(by["drift"], key=lambda r: -(r["edit_age_days"] or 0))
+
+    print("# Rule drift report")
+    print()
+    print(f"_{len(results)} rules across {len(docs)} governing docs. "
+          f"Reinforcement window: {days} days._")
+    print()
+    print(f"| verdict | count | meaning |")
+    print(f"|---|---|---|")
+    print(f"| enforced | {len(by['enforced'])} | a hook enforces it; alive regardless of talk |")
+    print(f"| reinforced | {len(by['reinforced'])} | its terms appear in the corpus this window |")
+    print(f"| unproven | {len(by['unproven'])} | edited recently, not yet reinforced |")
+    print(f"| drift | {len(drift)} | **demotion candidates** |")
+    print(f"| unscorable | {len(by['unscorable'])} | too generically worded to track — reword or accept |")
+    print()
+    print(f"## Demotion candidates ({len(drift)})")
+    print()
+    print("_No enforcer, no mention in the window, no recent edit. "
+          "Verify at the source before removing — a quiet rule may still be true._")
+    print()
+    for r in drift[:30]:
+        age = f"{r['edit_age_days']}d" if r["edit_age_days"] is not None else "untracked"
+        print(f"- **{r['rule']}** — `{r['doc']}:{r['lines']}`, last edited {age}")
+    if not drift:
+        print("- _(none)_")
+    print()
+    if verbose:
+        for name in ("unproven", "reinforced", "enforced"):
+            print(f"## {name.capitalize()} ({len(by[name])})")
+            print()
+            for r in by[name][:25]:
+                ev = ", ".join(r["enforcers"] or r["matched_terms"]) or "-"
+                print(f"- {r['rule']} — `{ev}`")
+            print()
 
 
 def _render_validated_section() -> list[str]:
@@ -1560,8 +2185,16 @@ def _render_tone_section(stats: dict) -> list[str]:
     lines.append("## Tone fingerprint")
     lines.append("")
     lines.append(
-        "_Quantitative voice card. Match this cadence when speaking as or for Nino: "
-        "short sentences, low hedge rate, imperative openings, no cheerleading._"
+        "_The canonical tone card lives in `~/.dotfiles/ways-of-working/voice.md` "
+        "(recalibrated 2026-08-03 over 3,850 decontaminated hand-typed messages). "
+        "On any conflict, that card wins._"
+    )
+    lines.append("")
+    lines.append(
+        "_The numbers below are computed over signal-bearing messages only — "
+        "messages that fired a correction/hedge/preference regex — so hedge and "
+        "question rates run high by construction. Treat them as corpus "
+        "diagnostics, not cadence targets._"
     )
     lines.append("")
     lines.append(f"- **Corpus**: {stats['messages']} user messages, {stats['sentences']} sentences")
@@ -1577,7 +2210,7 @@ def _render_tone_section(stats: dict) -> list[str]:
         lines.append(f"- **Top imperative verbs**: {top}")
     lines.append("")
     lines.append("**Style implications when responding as Poe:**")
-    lines.append("- Sentences average ~10–15 words; cap at 25 unless quoting.")
+    lines.append("- Sentences average ~8–12 words; cap at 25 unless quoting (his p90 is 20).")
     lines.append("- No \"I think\" / \"perhaps\" / \"maybe\" — assert or qualify with a concrete reason.")
     lines.append("- No \"great\" / \"perfect\" / \"absolutely\" — replace with neutral evaluation.")
     lines.append("- Start instructions with the verb, not the subject.")
@@ -1895,8 +2528,22 @@ def cmd_enqueue() -> None:
     path = payload.get("transcript_path") or payload.get("session_file") or ""
     if not path:
         return
+    source_client = payload.get("source_client")
+    if not source_client:
+        if "/.codex/" in str(path):
+            source_client = "codex"
+        elif "/.gemini/" in str(path):
+            source_client = "gemini"
+        else:
+            source_client = "claude"
+    entry = {
+        "source_client": source_client,
+        "session_id": payload.get("session_id") or "",
+        "transcript_path": str(path).strip(),
+        "cwd": payload.get("cwd") or "",
+    }
     with open(QUEUE_PATH, "a") as f:
-        f.write(path.strip() + "\n")
+        f.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
 
 def _maybe_opportunistic_catchup() -> None:
@@ -1946,7 +2593,8 @@ def cmd_extract(limit: int | None, since_days: int | None, session: str | None) 
         signals, inserted = _ingest_file(conn, jf)
         conn.close()
         print(
-            f"Session {jf.stem}: {signals} signals, {inserted} new (watermark advanced)",
+            f"Session {jf.stem}: {signals} mined records, {inserted} new "
+            "(watermark advanced)",
             file=sys.stderr,
         )
         return
@@ -2358,6 +3006,7 @@ def cmd_assemble(_skip_catchup: bool = False) -> None:
         lines.append(f"- `{proj}` — {count}")
     lines.append("")
 
+    POE_DIR.mkdir(parents=True, exist_ok=True)
     STACK_PATH.write_text("\n".join(lines))
     print(f"Stack written: {STACK_PATH} ({total} signals)", file=sys.stderr)
 
@@ -2377,9 +3026,38 @@ def main() -> None:
 
     c = sub.add_parser("catchup", help="watermark-driven idempotent sweep of all sessions")
     c.add_argument("--verbose", action="store_true", help="log even when nothing changed")
+    c.add_argument(
+        "--include-codex", action="store_true",
+        help="also sweep active and archived Codex transcripts",
+    )
+    c.add_argument(
+        "--include-gemini", action="store_true",
+        help="also sweep retained Gemini CLI transcripts",
+    )
 
     d = sub.add_parser("drain-queue", help="drain ~/.claude/poe/queue then catchup-sweep")
     d.add_argument("--verbose", action="store_true", help="log even when nothing changed")
+    d.add_argument(
+        "--include-codex", action="store_true",
+        help="include Codex transcripts in the fallback catchup sweep",
+    )
+    d.add_argument(
+        "--include-gemini", action="store_true",
+        help="include Gemini transcripts in the fallback catchup sweep",
+    )
+
+    rr = sub.add_parser(
+        "retention-report",
+        help="dry-run watermark coverage for archived Codex transcripts; never deletes",
+    )
+    rr.add_argument(
+        "--grace-days", type=int, default=7,
+        help="minimum archive age before reporting a covered file (default: 7)",
+    )
+    rr.add_argument(
+        "--list-covered", action="store_true",
+        help="include paths and watermark evidence for covered archived files",
+    )
 
     sub.add_parser("enqueue", help="hook command: read stdin JSON, append transcript_path to queue")
     sub.add_parser("prompt-hook", help="UserPromptSubmit hook: emit Poe context for the prompt")
@@ -2387,8 +3065,11 @@ def main() -> None:
     hs = sub.add_parser("hook-stats", help="summarize prompt-hook telemetry")
     hs.add_argument("--days", type=int, default=7)
 
-    df = sub.add_parser("drift", help="report stale labels (no reinforcement in 90+ days)")
-    df.add_argument("--verbose", action="store_true", help="also show active labels")
+    df = sub.add_parser("drift", help="report rules with no recent reinforcement")
+    df.add_argument("--days", type=int, default=90, help="reinforcement window")
+    df.add_argument("--labels", action="store_true", help="old behavior: stale voice labels")
+    df.add_argument("--json", action="store_true", dest="as_json")
+    df.add_argument("--verbose", action="store_true", help="also show live rules")
 
     ml = sub.add_parser("memory-link", help="cross-reference voice corpus with MEMORY.md indexes")
     ml.add_argument("--threshold", type=int, default=5, help="min signal count for promotion candidate")
@@ -2417,9 +3098,22 @@ def main() -> None:
     elif args.cmd == "assemble":
         cmd_assemble()
     elif args.cmd == "catchup":
-        cmd_catchup(verbose=args.verbose)
+        cmd_catchup(
+            verbose=args.verbose,
+            include_codex=args.include_codex,
+            include_gemini=args.include_gemini,
+        )
     elif args.cmd == "drain-queue":
-        cmd_drain_queue(verbose=args.verbose)
+        cmd_drain_queue(
+            verbose=args.verbose,
+            include_codex=args.include_codex,
+            include_gemini=args.include_gemini,
+        )
+    elif args.cmd == "retention-report":
+        cmd_retention_report(
+            grace_days=args.grace_days,
+            list_covered=args.list_covered,
+        )
     elif args.cmd == "enqueue":
         cmd_enqueue()
     elif args.cmd == "prompt-hook":
@@ -2427,7 +3121,10 @@ def main() -> None:
     elif args.cmd == "hook-stats":
         cmd_hook_stats(days=args.days)
     elif args.cmd == "drift":
-        cmd_drift(verbose=args.verbose)
+        if args.labels:
+            cmd_drift_labels(verbose=args.verbose)
+        else:
+            cmd_drift(days=args.days, verbose=args.verbose, as_json=args.as_json)
     elif args.cmd == "memory-link":
         cmd_memory_link(promote_threshold=args.threshold, verbose=args.verbose)
     elif args.cmd == "poe-check":
