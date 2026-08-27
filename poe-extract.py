@@ -24,8 +24,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
@@ -1721,7 +1723,7 @@ def cmd_memory_link(promote_threshold: int = 5, verbose: bool = False) -> None:
     conn.close()
 
 
-def cmd_drift(verbose: bool = False) -> None:
+def cmd_drift_labels(verbose: bool = False) -> None:
     """Report preference labels that haven't been reinforced lately.
     A 'drift candidate' is a label that:
       - has historical signals (≥3 total occurrences)
@@ -1759,7 +1761,7 @@ def cmd_drift(verbose: bool = False) -> None:
         else:
             fresh.append((stype, label, total, age))
 
-    print("# Poe drift report")
+    print("# Poe label-drift report")
     print()
     print(f"_Labels with ≥3 historical signals, sorted by staleness._")
     print()
@@ -1778,6 +1780,264 @@ def cmd_drift(verbose: bool = False) -> None:
         for stype, label, total, age in fresh[:20]:
             print(f"- `{stype}/{label}` — {total} signals, last seen {int(age)}d ago")
         print()
+
+
+# --- Rule drift -------------------------------------------------------------
+#
+# A "rule" is a heading in a governing instruction doc. Reinforcement is
+# evidence the rule is still live: a mechanical enforcer names it, Nino
+# restated it in the corpus, or its section was edited recently.
+#
+# The demotion path this exists for: a promoted rule with no reinforcement is
+# a candidate for removal. Without one, the instruction set only grows — and
+# Codex truncates the merged AGENTS.md chain at 32 KiB. (2026-08-26: the 630
+# browser-profile rules were BOTH superseded and nothing surfaced them.)
+
+RULE_DOCS_DEFAULT = (
+    "~/.dotfiles/ways-of-working/*.md",
+    "~/.claude/CLAUDE.md",
+    "~/.codex/AGENTS.md",
+)
+
+# Vague heading words that would match almost any transcript.
+RULE_STOPWORDS = {
+    "about", "after", "again", "against", "agent", "agents", "always", "another",
+    "because", "before", "being", "below", "better", "between", "build", "check",
+    "claim", "claude", "codex", "default", "defaults", "every", "first", "index",
+    "instead", "learned", "level", "measured", "never", "notes", "other",
+    "prefer", "reference", "rules", "second", "should", "small", "still", "their",
+    "there", "these", "thing", "things", "third", "those", "under", "using",
+    "verified", "watch", "where", "which", "while", "would", "write", "writing",
+}
+
+# Something that mechanically enforces a rule. A rule with one of these is
+# alive whether or not anyone talks about it.
+ENFORCER_RE = re.compile(r"`?([a-z][a-z0-9-]*(?:-guard|-reaper|-hook)\.py|[a-z][a-z0-9-]*\.py)`?")
+IDENT_RE = re.compile(r"`([^`\n]{3,40})`")
+
+
+def _rule_docs() -> list[Path]:
+    """Governing docs to scan. Override with POE_RULE_DOCS (colon-separated)."""
+    raw = os.environ.get("POE_RULE_DOCS")
+    if raw:
+        # An explicit override is exhaustive; do not silently widen it.
+        globs = raw.split(":")
+    else:
+        globs = list(RULE_DOCS_DEFAULT)
+        # A repo's own governing docs count when run inside one.
+        root = _git_root(Path.cwd())
+        for name in ("CLAUDE.md", "AGENTS.md"):
+            if root and (root / name).exists():
+                globs.append(str(root / name))
+    import glob as _glob
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for g in globs:
+        g = os.path.expanduser(g.strip())
+        matches = [Path(m) for m in sorted(_glob.glob(g))] if "*" in g else [Path(g)]
+        for m in matches:
+            if not m.is_file():
+                continue
+            key = m.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(m)
+    return out
+
+
+def _git_root(start: Path) -> Path | None:
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(start), capture_output=True, text=True, timeout=4,
+        )
+        return Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    except Exception:
+        return None
+
+
+def _rule_sections(path: Path) -> list[dict]:
+    """Split a doc into heading-delimited rules. One heading == one rule."""
+    try:
+        lines = path.read_text(errors="ignore").splitlines()
+    except Exception:
+        return []
+    heads = [
+        (i, len(m.group(1)), m.group(2).strip())
+        for i, ln in enumerate(lines, 1)
+        for m in [re.match(r"^(#{2,3})\s+(.*)", ln)]
+        if m
+    ]
+    out = []
+    for n, (start, level, title) in enumerate(heads):
+        # A rule owns its sub-rules: run to the next heading at the same or a
+        # higher level, not merely the next heading. Otherwise a `##` rule with
+        # `###` children scores on its intro paragraph alone — which flagged
+        # "Never fabricate Nino's interior state" as drift while its own
+        # sub-rule was the most-reinforced section in the file.
+        end = len(lines)
+        for m in range(n + 1, len(heads)):
+            if heads[m][1] <= level:
+                end = heads[m][0] - 1
+                break
+        body = "\n".join(lines[start:end])
+        out.append(
+            {"doc": path, "title": title, "level": level,
+             "start": start, "end": max(start, end), "body": body}
+        )
+    return out
+
+
+def _rule_terms(rule: dict) -> list[str]:
+    """Distinctive strings whose presence in the corpus means the rule was invoked.
+
+    Backticked identifiers in the body are far better evidence than heading
+    words — `browse-tool` or `op://` only appear when the rule is in play,
+    while "discipline" appears everywhere.
+    """
+    terms: list[str] = []
+    for ident in IDENT_RE.findall(rule["body"])[:60]:
+        ident = ident.strip().lower()
+        if not ident or ident.isdigit() or " " in ident:
+            continue
+        # Distinctive = looks like an identifier/path, or is simply long. A
+        # bare `git` or `main` matches every transcript and proves nothing.
+        if any(ch in ident for ch in "-._/:") or len(ident) >= 8:
+            terms.append(ident)
+    for w in re.findall(r"[a-zA-Z][a-zA-Z-]{6,}", rule["title"]):
+        w = w.lower()
+        if w not in RULE_STOPWORDS:
+            terms.append(w)
+    seen, uniq = set(), []
+    for t in terms:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq[:25]
+
+
+def _rule_enforcers(rule: dict) -> list[str]:
+    hits = {m for m in ENFORCER_RE.findall(rule["body"])}
+    return sorted(h for h in hits if h.endswith(".py"))
+
+
+def _section_edit_age(rule: dict) -> float | None:
+    """Days since these exact lines last changed. None if not in git."""
+    doc = rule["doc"]
+    root = _git_root(doc.parent)
+    if not root:
+        return None
+    try:
+        rel = doc.resolve().relative_to(root.resolve())
+    except Exception:
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "log", "-n1", "--format=%cI", "-s",
+             "-L", f"{rule['start']},{rule['end']}:{rel}"],
+            cwd=str(root), capture_output=True, text=True, timeout=10,
+        )
+        stamp = r.stdout.strip().splitlines()[0] if r.stdout.strip() else ""
+    except Exception:
+        return None
+    return _signal_age_days(stamp) if stamp else None
+
+
+def cmd_drift(days: int = 90, verbose: bool = False, as_json: bool = False) -> None:
+    """Report rules in the governing docs with no recent reinforcement.
+
+    A rule is alive if a hook enforces it, if Nino restated it in the corpus
+    within the window, or if its section was edited within the window.
+    Everything else is a demotion candidate."""
+    docs = _rule_docs()
+    if not docs:
+        print("No rule docs found. Set POE_RULE_DOCS.", file=sys.stderr)
+        return
+    haystack = ""
+    if RECALL_DB.exists():
+        conn = db_connect()
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        rows = conn.execute(
+            "SELECT phrase, message FROM voice_signals WHERE timestamp >= ?", (since,)
+        ).fetchall()
+        conn.close()
+        haystack = " ".join(
+            (p or "").lower() + " " + (m or "").lower() for p, m in rows
+        )
+
+    results = []
+    for doc in docs:
+        for rule in _rule_sections(doc):
+            terms = _rule_terms(rule)
+            enforcers = _rule_enforcers(rule)
+            matched = [t for t in terms if len(t) >= 5 and t in haystack][:3] if haystack else []
+            edit_age = _section_edit_age(rule)
+            if enforcers:
+                verdict = "enforced"
+            elif matched:
+                verdict = "reinforced"
+            elif len(terms) < 2:
+                # One generic term is not enough to call a rule dead. "## Preferences"
+                # scores on the word "preferences" alone; absence of that word proves
+                # nothing. Unscorable is the honest verdict, and it names its own fix:
+                # reword the rule so it contains something distinctive.
+                verdict = "unscorable"
+            elif edit_age is not None and edit_age <= days:
+                verdict = "unproven"
+            else:
+                verdict = "drift"
+            results.append({
+                "doc": str(doc).replace(str(Path.home()), "~"),
+                "rule": rule["title"],
+                "lines": f"{rule['start']}-{rule['end']}",
+                "verdict": verdict,
+                "enforcers": enforcers,
+                "matched_terms": matched,
+                "edit_age_days": None if edit_age is None else int(edit_age),
+            })
+
+    if as_json:
+        print(json.dumps({"window_days": days, "rules": results}, indent=2))
+        return
+
+    by = defaultdict(list)
+    for r in results:
+        by[r["verdict"]].append(r)
+    drift = sorted(by["drift"], key=lambda r: -(r["edit_age_days"] or 0))
+
+    print("# Rule drift report")
+    print()
+    print(f"_{len(results)} rules across {len(docs)} governing docs. "
+          f"Reinforcement window: {days} days._")
+    print()
+    print(f"| verdict | count | meaning |")
+    print(f"|---|---|---|")
+    print(f"| enforced | {len(by['enforced'])} | a hook enforces it; alive regardless of talk |")
+    print(f"| reinforced | {len(by['reinforced'])} | its terms appear in the corpus this window |")
+    print(f"| unproven | {len(by['unproven'])} | edited recently, not yet reinforced |")
+    print(f"| drift | {len(drift)} | **demotion candidates** |")
+    print(f"| unscorable | {len(by['unscorable'])} | too generically worded to track — reword or accept |")
+    print()
+    print(f"## Demotion candidates ({len(drift)})")
+    print()
+    print("_No enforcer, no mention in the window, no recent edit. "
+          "Verify at the source before removing — a quiet rule may still be true._")
+    print()
+    for r in drift[:30]:
+        age = f"{r['edit_age_days']}d" if r["edit_age_days"] is not None else "untracked"
+        print(f"- **{r['rule']}** — `{r['doc']}:{r['lines']}`, last edited {age}")
+    if not drift:
+        print("- _(none)_")
+    print()
+    if verbose:
+        for name in ("unproven", "reinforced", "enforced"):
+            print(f"## {name.capitalize()} ({len(by[name])})")
+            print()
+            for r in by[name][:25]:
+                ev = ", ".join(r["enforcers"] or r["matched_terms"]) or "-"
+                print(f"- {r['rule']} — `{ev}`")
+            print()
 
 
 def _render_validated_section() -> list[str]:
@@ -2751,8 +3011,11 @@ def main() -> None:
     hs = sub.add_parser("hook-stats", help="summarize prompt-hook telemetry")
     hs.add_argument("--days", type=int, default=7)
 
-    df = sub.add_parser("drift", help="report stale labels (no reinforcement in 90+ days)")
-    df.add_argument("--verbose", action="store_true", help="also show active labels")
+    df = sub.add_parser("drift", help="report rules with no recent reinforcement")
+    df.add_argument("--days", type=int, default=90, help="reinforcement window")
+    df.add_argument("--labels", action="store_true", help="old behavior: stale voice labels")
+    df.add_argument("--json", action="store_true", dest="as_json")
+    df.add_argument("--verbose", action="store_true", help="also show live rules")
 
     ml = sub.add_parser("memory-link", help="cross-reference voice corpus with MEMORY.md indexes")
     ml.add_argument("--threshold", type=int, default=5, help="min signal count for promotion candidate")
@@ -2804,7 +3067,10 @@ def main() -> None:
     elif args.cmd == "hook-stats":
         cmd_hook_stats(days=args.days)
     elif args.cmd == "drift":
-        cmd_drift(verbose=args.verbose)
+        if args.labels:
+            cmd_drift_labels(verbose=args.verbose)
+        else:
+            cmd_drift(days=args.days, verbose=args.verbose, as_json=args.as_json)
     elif args.cmd == "memory-link":
         cmd_memory_link(promote_threshold=args.threshold, verbose=args.verbose)
     elif args.cmd == "poe-check":
