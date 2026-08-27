@@ -452,6 +452,53 @@ def session_id_for(session_file: Path) -> str:
     return session_file.stem
 
 
+# Codex writes one rollout per *agent*, not per conversation. 89% of the files
+# under ~/.codex/sessions are subagents: 454 "guardian" permission-classifier
+# sessions plus every thread_spawn child. Their `user_message` events are
+# written by Codex or by a parent agent — never by Nino — and the guardian's
+# prompt embeds the parent transcript verbatim, so ingesting it filed the
+# agent's own prose as Nino correcting the agent, replayed once per assessment.
+# (2026-08-26: 866 of 1008 codex rows were 40 messages repeated this way.)
+#
+# session_meta.payload.source says so structurally. Real sessions carry a
+# string ("vscode"); subagents carry {"subagent": {...}}.
+_CODEX_SUBAGENT_CACHE: dict[str, str | None] = {}
+
+
+def codex_subagent_kind(session_file: Path) -> str | None:
+    """Name of the subagent that owns this rollout, or None for a real session."""
+    key = str(session_file)
+    if key in _CODEX_SUBAGENT_CACHE:
+        return _CODEX_SUBAGENT_CACHE[key]
+    kind: str | None = None
+    try:
+        with open(session_file, "r", errors="replace") as stream:
+            for index, line in enumerate(stream):
+                if index > 20:
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "session_meta":
+                    continue
+                payload = obj.get("payload")
+                source = payload.get("source") if isinstance(payload, dict) else None
+                if isinstance(source, dict) and "subagent" in source:
+                    inner = source.get("subagent")
+                    if isinstance(inner, dict):
+                        kind = next(iter(inner.keys()), "subagent")
+                        if kind == "other" and isinstance(inner.get("other"), str):
+                            kind = inner["other"]
+                    else:
+                        kind = "subagent"
+                break
+    except OSError:
+        kind = None
+    _CODEX_SUBAGENT_CACHE[key] = kind
+    return kind
+
+
 def _claude_message_text(obj: dict) -> str | None:
     """Extract prose from a Claude user/assistant event; reject tool results."""
     message = obj.get("message")
@@ -476,6 +523,9 @@ def _claude_message_text(obj: dict) -> str | None:
 def iter_transcript_messages(session_file: Path):
     """Yield normalized `(timestamp, role, phase, text)` message events."""
     source = transcript_source(session_file)
+    if source == "codex" and codex_subagent_kind(session_file):
+        # Not Nino's voice. See codex_subagent_kind.
+        return
     if source == "gemini":
         try:
             data = json.loads(session_file.read_text(errors="replace"))
